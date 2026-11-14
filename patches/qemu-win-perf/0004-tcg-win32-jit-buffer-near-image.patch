@@ -1,0 +1,72 @@
+diff --git a/tcg/region.c b/tcg/region.c
+index 2bf3ce3..87a4618 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -476,6 +476,48 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
+    ? DEFAULT_CODE_GEN_BUFFER_SIZE_1 : MAX_CODE_GEN_BUFFER_SIZE)
+ 
+ #if defined(_WIN32)
++/*
++ * Put the JIT buffer next to the executable's image when there is room.
++ * The image is ASLR-relocated (DYNAMIC_BASE, HIGH_ENTROPY_VA) and
++ * VirtualAlloc(NULL) usually lands more than 2 GiB away from it, so every
++ * helper call from translated code (softfloat, memory slow paths, ...) is an
++ * indirect "call *pool(%rip)" (tcg_out_branch(), tcg/i386).  Within +-2 GiB of
++ * the image's .text it is a direct "call rel32".  With a buffer larger than
++ * 2 GiB minus the image only its low part gets direct calls; tcg_out_branch()
++ * picks per call, so any placement is correct.  Fall back to anywhere.
++ */
++static void *alloc_code_gen_buffer_near_image(size_t size)
++{
++    const uintptr_t gran = 64 * KiB;    /* allocation granularity */
++    const uint8_t *image = (const uint8_t *)GetModuleHandleW(NULL);
++    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)image;
++    const IMAGE_NT_HEADERS *nt =
++        (const IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
++    uintptr_t start = (uintptr_t)image;
++    uintptr_t end = ROUND_UP(start + nt->OptionalHeader.SizeOfImage, gran);
++    void *buf;
++
++    /* Just above the image, then a few steps further up ... */
++    for (int i = 0; i < 16; i++) {
++        uintptr_t at = end + i * 16 * MiB;
++        buf = VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++        if (buf) {
++            return buf;
++        }
++    }
++    /* ... then just below it. */
++    for (int i = 0; i < 16 && start > size + i * 16 * MiB; i++) {
++        uintptr_t at = ROUND_DOWN(start - size - i * 16 * MiB, gran);
++        buf = VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++        if (buf) {
++            return buf;
++        }
++    }
++    return NULL;
++}
++
+ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+ {
+     void *buf;
+@@ -485,12 +527,15 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+         return -1;
+     }
+ 
+-    buf = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+-                             PAGE_EXECUTE_READWRITE);
++    buf = alloc_code_gen_buffer_near_image(size);
++    if (buf == NULL) {
++        buf = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++    }
+     if (buf == NULL) {
+         error_setg_win32(errp, GetLastError(),
+                          "allocate %zu bytes for jit buffer", size);
+-        return false;
++        return -1;  /* was "return false" (0, a valid prot set) */
+     }
+ 
+     region.start_aligned = buf;

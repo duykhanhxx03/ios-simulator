@@ -1,0 +1,10 @@
+# Build outputs
+target/
+*.exe
+*.obj
+*.pdb
+# Vulkan/Khronos headers vendored for the spike (fetch them again from KhronosGroup)
+spikes/hostvm-import/include/
+# Run logs, frame census, benchmark output
+runs/
+__pycache__/
