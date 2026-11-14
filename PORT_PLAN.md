@@ -59,4 +59,11 @@ Kết luận: tương đương trên Windows của cơ chế Linux mà reims-vgp
   - ✅ C library reims-vgpu build trên Windows (commit `76579074`): `reims-graphics` chỉ Unix, C API `rvg_graphics_*` trả UNSUPPORTED trên Windows; fd của memory file = HANDLE section (DuplicateHandle)
   - ✅ `libreims_vgpu.a` (windows-gnu, UCRT64, cargo của MSYS2 + RUSTC_BOOTSTRAP): `scripts/build-reims-win.sh` → `D:\vpw\dist\reims`
   - ✅ QEMU **có GPU** `D:\vpw\build\qemu-pvg\qemu-system-aarch64.exe` (359 MB): `memory-backend-section`, `apple-gfx` lấy HANDLE section, meson bật PVG cho TCG Windows. Chạy từ PowerShell (bash MSYS2 báo thiếu API set `api-ms-win-core-realtime`, bỏ qua được)
-- [ ] **M5** cửa sổ/input (SDL3), vsock, đo fps; gửi patch ngược cho upstream
+- [~] **M5** cửa sổ/input (SDL3), vsock, đo fps; gửi patch ngược cho upstream
+  - ✅ vsock: `virtio-vsock-sock-pci` (QEMU `2dbaf4c`), host TCP 127.0.0.1:13390, `tools\vphoned.py`; vphoned trả health 200 trên iOS thật. Đã dùng để đặt Reduce Motion/Transparency, `BKNoWatchdogs`, múi giờ Asia/Ho_Chi_Minh, `system.shutdown`
+  - ✅ đo fps: `tools\winbench.py` / `bench-run.ps1` (cuộn Settings như `scroll-measure.sh`, 3 lượt)
+  - Kết quả (fps trung bình, i5-12400F + RTX 5060): 21.8 ban đầu → 35.8 (SMP 6 + NVIDIA "Prefer maximum performance") → 36–38 (448x932). Bản `-O3`/LTO + 4 bản vá Windows: 33–35, không hơn
+  - ✅ sửa luồng stdin quay vòng (QEMU `b11ed48`, trước đó tốn trắng 1 core); tắt implicit Vulkan layer (TikTok LIVE Studio, Epic overlay) trong launcher
+  - Nhánh QEMU `windows-perf` (chưa build/đo trên Windows): `asid-ng`, `tb-recycle` của upstream + 4 bản vá host. Nhánh `windows` = bản đang dùng
+  - Giới hạn chính là CPU (TCG): GPU chỉ dùng khoảng 3%, mỗi frame khoảng 0.4 ms. Muốn mượt như máy thật thì cần chip ARM (Mac Apple Silicon + vphone-cli; nhánh `vphone-kvm` của upstream mới boot tới launchd trên M1 Pro chạy Asahi)
+  - Còn mở: mạng (vphoned báo IP 10.0.2.15, chưa thử internet), âm thanh, gửi patch lên upstream
