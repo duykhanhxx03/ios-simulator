@@ -1,0 +1,34 @@
+From df16b10313c82af37f4ca3884f1cc00951ba1bc6 Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 22:48:01 +0700
+Subject: [PATCH 7/8] tcg: VPHONE_TCG_SIZES: replace the output file on Windows
+
+rename() does not replace an existing file on Windows, so every dump of
+the VPHONE_TCG_SIZES breakdown after the first stayed in <path>.tmp.
+Use MoveFileExA(MOVEFILE_REPLACE_EXISTING) there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tcg/tcg.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index ff4e57c..211cc03 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -6997,7 +6997,12 @@ static void *vts_thread(void *opaque)
+             fprintf(f, "call %s %" PRIu64 " %" PRIu64 "\n", ci[i]->name, cc[i], cb[i]);
+         }
+         fclose(f);
++#ifdef _WIN32
++        /* rename() does not replace an existing file on Windows. */
++        MoveFileExA(tmp, vts_path, MOVEFILE_REPLACE_EXISTING);
++#else
+         rename(tmp, vts_path);
++#endif
+     }
+     return NULL;
+ }
+-- 
+2.47.0.windows.2
+

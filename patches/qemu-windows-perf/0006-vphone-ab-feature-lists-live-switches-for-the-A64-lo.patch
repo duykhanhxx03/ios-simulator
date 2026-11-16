@@ -1,0 +1,114 @@
+From 8bba3141bc33040efc2d29e7e4b3bf478daefa1a Mon Sep 17 00:00:00 2001
+From: YahiaAngelo <yahia.mostafa.elsayed@gmail.com>
+Date: Thu, 12 Nov 2026 00:50:35 +0200
+Subject: [PATCH 6/8] vphone-ab: feature lists; live switches for the A64
+ lookup features
+
+VPHONE_AB_WHAT now takes a comma-separated list. New translate-time
+switches: ret_prefetch_off, xpage_off, ras_off, ibc_off turn off
+VPHONE_RET_PREFETCH, VPHONE_XPAGE_LINKS, VPHONE_RAS and VPHONE_IBC in
+arm 1 (the switch flushes every TB, so all code follows the arm).
+
+In-VM ABBA on the Duo app workload (12 steps): all four off used 7.7%
+more vCPU cycles; the inline return-address prefetch alone off used
+2.4% fewer, so it stays off (as the vphone-linux launcher has it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N89PWg24VJrcxX3MuUo4uM
+---
+ include/qemu/vphone-ab.h       | 22 +++++++++++++++++++---
+ target/arm/tcg/translate-a64.c | 10 +++++++---
+ 2 files changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/include/qemu/vphone-ab.h b/include/qemu/vphone-ab.h
+index cf00fd1..5111d4d 100644
+--- a/include/qemu/vphone-ab.h
++++ b/include/qemu/vphone-ab.h
+@@ -5,7 +5,10 @@
+  * every vCPU's TLB with it, so code paths that test vphone_ab_arm at translation or run time
+  * switch for the whole guest. VPHONE_AB=<0|1> sets the starting arm. Off (arm 0, no thread)
+  * without VPHONE_AB_FILE. VPHONE_AB_WHAT=<feature> names the code path arm 1 switches
+- * (vphone_ab()): asid_ng_off (cputlb.c: full flush on an ASID switch, as before).
++ * (vphone_ab()); a comma-separated list names several: asid_ng_off (cputlb.c: full flush on
++ * an ASID switch, as before), tb_recycle (tb-maint.c), and the translator's ret_prefetch_off,
++ * xpage_off, ras_off, ibc_off (target/arm/tcg/translate-a64.c: VPHONE_RET_PREFETCH,
++ * VPHONE_XPAGE_LINKS, VPHONE_RAS, VPHONE_IBC off).
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -18,8 +21,21 @@ extern const char *vphone_ab_what;
+ /* Arm 1, and VPHONE_AB_WHAT names @feature: the code path under test is switched. */
+ static inline bool vphone_ab(const char *feature)
+ {
+-    return __builtin_expect(vphone_ab_arm, 0) && vphone_ab_what &&
+-           !strcmp(vphone_ab_what, feature);
++    size_t n;
++    const char *w;
++
++    if (!__builtin_expect(vphone_ab_arm, 0) || !vphone_ab_what) {
++        return false;
++    }
++    n = strlen(feature);
++    for (w = vphone_ab_what; *w; ) {
++        size_t m = strcspn(w, ",");
++        if (m == n && !memcmp(w, feature, n)) {
++            return true;
++        }
++        w += m + (w[m] == ',');
++    }
++    return false;
+ }
+ 
+ #endif
+diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
+index 028e6c2..00d6444 100644
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -21,6 +21,7 @@
+ #include "tcg/tcg-op-common.h"
+ #include "translate.h"
+ #include "translate-a64.h"
++#include "qemu/vphone-ab.h"
+ #include "host-fpcr.h"
+ #include "qemu/log.h"
+ #include "arm_ldst.h"
+@@ -486,6 +487,9 @@ static void vphone_gen_prefetch_ret(DisasContext *s, TCGv_i64 lr)
+         const char *e = getenv("VPHONE_RET_PREFETCH");
+         on = e && *e ? atoi(e) : 0;
+     }
++    if (vphone_ab("ret_prefetch_off")) {
++        return;
++    }
+     if (on == 1) {
+         gen_helper_vphone_prefetch_ret(tcg_env, lr);
+     } else if (on == 2) {
+@@ -524,7 +528,7 @@ static bool vphone_xpage_links(void)
+         const char *e = getenv("VPHONE_XPAGE_LINKS");
+         on = e && *e && *e != '0';
+     }
+-    return on;
++    return on && !vphone_ab("xpage_off");
+ }
+ 
+ /*
+@@ -641,7 +645,7 @@ static bool vphone_ras(DisasContext *s)
+         const char *e = getenv("VPHONE_RAS");
+         mode = e && *e ? atoi(e) : 1;
+     }
+-    return mode && vphone_inline_lookup() >= 1 &&
++    return mode && !vphone_ab("ras_off") && vphone_inline_lookup() >= 1 &&
+            (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active;
+ }
+ 
+@@ -805,7 +809,7 @@ static bool vphone_ibc(DisasContext *s)
+     default:
+         return false;
+     }
+-    return mode && vphone_inline_lookup() >= 1 &&
++    return mode && !vphone_ab("ibc_off") && vphone_inline_lookup() >= 1 &&
+            (tb_cflags(s->base.tb) & CF_PCREL) && !s->ss_active &&
+            !dc_isar_feature(aa64_bti, s);
+ }
+-- 
+2.47.0.windows.2
+

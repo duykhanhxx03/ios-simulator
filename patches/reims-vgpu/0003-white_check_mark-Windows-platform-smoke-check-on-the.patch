@@ -1,0 +1,245 @@
+From 9936ed5bde7ed7ffd90d9073df653b5592a79900 Mon Sep 17 00:00:00 2001
+From: virt-ios <virt-ios@localhost>
+Date: Sat, 14 Nov 2026 14:03:42 +0700
+Subject: [PATCH 3/4] :white_check_mark: Windows platform smoke check on the
+ host GPU
+
+os::gpu_import_smoke (doc-hidden): guest pages from allocate_aliasable viewed backwards through remap_runs_shared_overwrite, imported by import_view and host_memory into a no-copy buffer, filled by a blit, checked in the guest's own pages. A program runs it (the crate's tests need core's testkit, which is Unix's); os/windows/tests.rs holds the Windows test helpers and the Mach-rules test for when the testkit builds.
+
+Verified: SMOKE OK on an RTX 5060, imported by pointer (no copy).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-vulkan/src/os.rs            |  4 +
+ crates/reims-vgpu-vulkan/src/os/windows.rs    |  9 ++
+ .../reims-vgpu-vulkan/src/os/windows/smoke.rs | 89 +++++++++++++++++++
+ .../reims-vgpu-vulkan/src/os/windows/tests.rs | 82 +++++++++++++++++
+ 4 files changed, 184 insertions(+)
+ create mode 100644 crates/reims-vgpu-vulkan/src/os/windows/smoke.rs
+ create mode 100644 crates/reims-vgpu-vulkan/src/os/windows/tests.rs
+
+diff --git a/crates/reims-vgpu-vulkan/src/os.rs b/crates/reims-vgpu-vulkan/src/os.rs
+index 411139d6..a2f55250 100644
+--- a/crates/reims-vgpu-vulkan/src/os.rs
++++ b/crates/reims-vgpu-vulkan/src/os.rs
+@@ -31,6 +31,10 @@ use linux as host_os;
+ use macos as host_os;
+ #[cfg(windows)]
+ use windows as host_os;
++/// The Windows platform's smoke check on the host's GPU (`os/windows/smoke.rs`).
++#[cfg(windows)]
++#[doc(hidden)]
++pub use windows::gpu_import_smoke;
+ 
+ use std::sync::Arc;
+ 
+diff --git a/crates/reims-vgpu-vulkan/src/os/windows.rs b/crates/reims-vgpu-vulkan/src/os/windows.rs
+index e86a3f22..2274f387 100644
+--- a/crates/reims-vgpu-vulkan/src/os/windows.rs
++++ b/crates/reims-vgpu-vulkan/src/os/windows.rs
+@@ -13,10 +13,19 @@ mod clock;
+ mod files;
+ mod host_ram;
+ mod import;
++mod smoke;
+ mod surface;
++#[cfg(test)]
++mod tests;
++
++#[doc(hidden)]
++pub use smoke::gpu_import_smoke;
+ mod threads;
+ mod vm;
+ 
++#[cfg(test)]
++pub(crate) use tests::{PAGE, mapped, writable};
++
+ use std::ffi::CStr;
+ 
+ use ash::vk;
+diff --git a/crates/reims-vgpu-vulkan/src/os/windows/smoke.rs b/crates/reims-vgpu-vulkan/src/os/windows/smoke.rs
+new file mode 100644
+index 00000000..2eb48684
+--- /dev/null
++++ b/crates/reims-vgpu-vulkan/src/os/windows/smoke.rs
+@@ -0,0 +1,89 @@
++//! A smoke check of the Windows platform on the host's GPU, for a program to run where the
++//! crate's tests cannot build (core's testkit is Unix's): guest pages scattered in a view,
++//! imported into the GPU by pointer, written by the GPU, the writes seen in the guest's pages.
++
++use std::ptr::NonNull;
++
++use metal2vulkan_runtime as rt;
++use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
++
++use super::*;
++
++const PAGE: u64 = 4096;
++
++fn fill(at: HostAddr, len: u64, byte: u8) {
++    // SAFETY: the smoke check's own writable pages.
++    unsafe { at.as_ptr::<u8>().write_bytes(byte, len as usize) };
++}
++
++fn byte(at: HostAddr) -> u8 {
++    // SAFETY: the smoke check's own readable pages.
++    unsafe { at.as_ptr::<u8>().read_volatile() }
++}
++
++/// Runs the check: its report lines, or why it failed.
++#[doc(hidden)]
++pub fn gpu_import_smoke() -> Result<Vec<String>, String> {
++    let mut report = Vec::new();
++
++    let device = rt::Device::system_default().map_err(|e| format!("no Vulkan device: {e:?}"))?;
++    report.push(format!("device: {}", device.properties().name));
++    learn_view_imports(&device);
++    let vm = WindowsVm::new();
++    let n = 64u64;
++    let guest = allocate_aliasable(n * PAGE).map_err(|e| format!("{e:?}"))?;
++    for i in 0..n {
++        fill(guest.wrapping_add(i * PAGE), PAGE, i as u8);
++    }
++    let view = vm.allocate_anywhere(n * PAGE).map_err(|e| format!("{e:?}"))?;
++    let runs: Vec<(HostAddr, u64)> = (0..n)
++        .map(|i| (guest.wrapping_add((n - 1 - i) * PAGE), PAGE))
++        .collect();
++    vm.remap_runs_shared_overwrite(view, &runs).map_err(|e| format!("{e:?}"))?;
++
++    let at = NonNull::new(view.as_ptr::<u8>()).ok_or("a null view")?;
++    let iv = import_view(at, n * PAGE);
++    if !(!iv.writes_kept()) { return Err("writable guest pages need no twin".into()); }
++    // SAFETY: the view stays mapped until after the buffer is released below.
++    let memory = unsafe { host_memory(iv.at(), false) };
++    let contents = rt::BufferContents::NoCopy {
++        memory,
++        deallocator: None,
++        keep_alive: None,
++    };
++    let copies_before = device.work_counts().copied_host_buffers_made;
++    let descriptor = rt::BufferDescriptor::new(n * PAGE, rt::ResourceOptions::shared(), contents)
++        .with_placement(rt::AddressPlacement::Outside);
++    let buffer = device.new_buffer_with_descriptor(descriptor).map_err(|e| format!("{e:?}"))?;
++    let copied = device.work_counts().copied_host_buffers_made > copies_before;
++    report.push(format!("imported by pointer: {}", !copied));
++
++    let queue = device.new_command_queue().map_err(|e| format!("{e:?}"))?;
++    let cb = queue.command_buffer().map_err(|e| format!("{e:?}"))?;
++    let mut blit = cb.blit_command_encoder().map_err(|e| format!("{e:?}"))?;
++    blit.fill_buffer(&buffer, 5 * PAGE..6 * PAGE, 0xAB).map_err(|e| format!("{e:?}"))?;
++    blit.fill_buffer(&buffer, 40 * PAGE + 16..40 * PAGE + 32, 0xCD).map_err(|e| format!("{e:?}"))?;
++    blit.end_encoding().map_err(|e| format!("{e:?}"))?;
++    cb.commit().map_err(|e| format!("{e:?}"))?;
++    cb.wait_until_completed().map_err(|e| format!("{e:?}"))?;
++
++    // View page i is guest page n-1-i.
++    let g5 = guest.wrapping_add((n - 1 - 5) * PAGE);
++    if (byte(g5), byte(g5.wrapping_add(PAGE - 1))) != (0xAB, 0xAB) { return Err(format!("bytes {:?} != {:?}", (byte(g5), byte(g5.wrapping_add(PAGE - 1))), (0xAB, 0xAB))); }
++    let g40 = guest.wrapping_add((n - 1 - 40) * PAGE);
++    if (byte(g40.wrapping_add(15)), byte(g40.wrapping_add(16)), byte(g40.wrapping_add(32))) != ((n - 1 - 40) as u8, 0xCD, (n - 1 - 40) as u8) { return Err(format!("bytes {:?} != {:?}", (byte(g40.wrapping_add(15)), byte(g40.wrapping_add(16)), byte(g40.wrapping_add(32))), ((n - 1 - 40) as u8, 0xCD, (n - 1 - 40) as u8))); }
++    let g4 = byte(guest.wrapping_add((n - 1 - 4) * PAGE));
++    if g4 != (n - 1 - 4) as u8 {
++        return Err(format!("an unwritten page changed: {g4:#x}"));
++    }
++    if copied {
++        return Err("the view was copied, not imported by pointer".into());
++    }
++    report.push("GPU writes landed in the scattered guest pages".into());
++
++    drop(buffer);
++    drop(iv);
++    vm.deallocate(view, n * PAGE);
++    vm.deallocate(guest, n * PAGE);
++    Ok(report)
++}
+diff --git a/crates/reims-vgpu-vulkan/src/os/windows/tests.rs b/crates/reims-vgpu-vulkan/src/os/windows/tests.rs
+new file mode 100644
+index 00000000..6feaf6f2
+--- /dev/null
++++ b/crates/reims-vgpu-vulkan/src/os/windows/tests.rs
+@@ -0,0 +1,82 @@
++//! The Windows platform's tests: the views of guest pages (`vm`, `files`) and their import into
++//! the GPU (`import`), on the host's Vulkan device. A test that needs a GPU skips where there is
++//! none (a CI runner without one).
++
++use std::ptr::NonNull;
++
++use metal2vulkan_runtime as rt;
++use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _, KernReturn, VmProt};
++
++use super::*;
++
++/// One page of the host's.
++pub(crate) const PAGE: u64 = 4096;
++
++/// Whether the page at `at` is mapped and readable.
++pub(crate) fn mapped(at: HostAddr) -> bool {
++    winvm::readable(at.addr() as u64, 1)
++}
++
++/// Whether `len` bytes at `at` are mapped writable (`VirtualQuery`'s protection).
++pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
++    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
++    let mut cur = at.addr() as u64;
++    let end = cur + len.max(1);
++    while cur < end {
++        // SAFETY: a query of this process's address space into a valid out-structure.
++        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
++        let n = unsafe {
++            VirtualQuery(
++                std::ptr::with_exposed_provenance(cur as usize),
++                &mut mbi,
++                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
++            )
++        };
++        // PAGE_READWRITE (4) or PAGE_WRITECOPY (8), committed (0x1000).
++        if n == 0 || mbi.State != 0x1000 || mbi.Protect & (0x04 | 0x08) == 0 {
++            return false;
++        }
++        cur = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
++    }
++    true
++}
++
++fn fill(at: HostAddr, len: u64, byte: u8) {
++    // SAFETY: test-owned writable pages.
++    unsafe { at.as_ptr::<u8>().write_bytes(byte, len as usize) };
++}
++
++fn byte(at: HostAddr) -> u8 {
++    // SAFETY: test-owned readable page.
++    unsafe { at.as_ptr::<u8>().read_volatile() }
++}
++
++/// Mach's rules hold: a view of scattered pages aliases them both ways, a read-only protect is
++/// read-only, and a registered range (the guest's RAM) is not deallocated.
++#[test]
++fn views_alias_scattered_pages_as_machs_remap_does() {
++    let vm = WindowsVm::new();
++    assert_eq!(vm.page_size(), PAGE);
++    let n = 16u64;
++    let src = allocate_aliasable(n * PAGE).unwrap();
++    for i in 0..n {
++        fill(src.wrapping_add(i * PAGE), PAGE, 0x40 + i as u8);
++    }
++    let view = vm.allocate_anywhere(n * PAGE).unwrap();
++    let runs: Vec<(HostAddr, u64)> = (0..n)
++        .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
++        .collect();
++    vm.remap_runs_shared_overwrite(view, &runs).unwrap();
++    for i in 0..n {
++        assert_eq!(byte(view.wrapping_add(i * PAGE)), 0x40 + (n - 1 - i) as u8);
++    }
++    fill(view.wrapping_add(3 * PAGE + 7), 1, 0xEE);
++    assert_eq!(byte(src.wrapping_add((n - 1 - 3) * PAGE + 7)), 0xEE);
++    vm.protect_max(view, PAGE, VmProt::READ).unwrap();
++    assert!(mapped(view) && !writable(view, PAGE));
++    assert!(writable(view.wrapping_add(PAGE), PAGE));
++    assert_eq!(vm.remap_shared_overwrite(view, view, 0), Err(KernReturn(4)));
++    assert!(vm.deallocate(view, n * PAGE).is_success());
++    assert!(vm.deallocate(src, n * PAGE).is_success());
++}
++
+-- 
+2.47.0.windows.2
+

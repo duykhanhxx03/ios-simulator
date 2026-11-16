@@ -1,0 +1,1152 @@
+From 2dbaf4cfb6ef96b9f045bbd57c551af4ccd660ed Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 21:39:32 +0700
+Subject: [PATCH 4/5] hw/virtio: virtio-vsock-sock-pci, vsock with the datapath
+ in QEMU
+
+vhost-vsock-pci needs Linux's vhost-vsock. This device runs the
+virtio-vsock transport inside QEMU, so it works on Windows. The host
+side is a listening socket, TCP (host-port=, host-addr= default
+127.0.0.1) and/or AF_UNIX (uds-path=), speaking Firecracker's hybrid
+vsock protocol: "CONNECT <port>\n", answered "OK <host port>\n" once
+the guest accepts, then a raw stream. With uds-path=, guest
+connections to host port P go to "<uds-path>_<P>".
+
+Also registered as virtio-vsock-uds-pci, the name of the equivalent
+device on qemu-vphone's vsock-uds branch that vphone-linux's
+run-vphone.sh looks for.
+
+- 256-entry queues: the iOS virtio driver assumes page-aligned rings.
+- The host advertises buf-alloc (default 4 MiB) and buffers what the
+  host socket has not taken; guest-to-host credit is never capped by a
+  socket buffer. Host-to-guest data respects the guest's
+  buf_alloc/fwd_cnt; QEMU sends CREDIT_REQUEST when the guest's credit
+  falls under a quarter of its window, and again every 200 ms while it
+  is zero (iOS volunteers an update only when its window is nearly
+  full).
+- Host connections are shut down before close: on Windows closing the
+  socket alone did not send the peer a FIN.
+- VPHONE_VSOCK_DEBUG=1 logs connections and packets on stderr.
+- Not migratable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/virtio/Kconfig             |    5 +
+ hw/virtio/meson.build         |    1 +
+ hw/virtio/virtio-vsock-sock.c | 1076 +++++++++++++++++++++++++++++++++
+ 3 files changed, 1082 insertions(+)
+ create mode 100644 hw/virtio/virtio-vsock-sock.c
+
+diff --git a/hw/virtio/Kconfig b/hw/virtio/Kconfig
+index fc6e9e9..ae82bdf 100644
+--- a/hw/virtio/Kconfig
++++ b/hw/virtio/Kconfig
+@@ -81,6 +81,11 @@ config VHOST_VSOCK
+     select VHOST_VSOCK_COMMON
+     depends on VIRTIO && VHOST_KERNEL
+ 
++config VIRTIO_VSOCK_SOCK
++    bool
++    default y
++    depends on VIRTIO_PCI
++
+ config VHOST_VDPA_DEV
+     bool
+     default y
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 22952cd..69ec895 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -33,6 +33,7 @@ system_virtio_ss.add(when: 'CONFIG_VIRTIO_NSM', if_true: [files('cbor-helpers.c'
+ 
+ virtio_pci_ss = ss.source_set()
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_VSOCK', if_true: files('vhost-vsock-pci.c'))
++virtio_pci_ss.add(when: 'CONFIG_VIRTIO_VSOCK_SOCK', if_true: files('virtio-vsock-sock.c'))
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_SCSI', if_true: files('vhost-scsi-pci.c'))
+ 
+ virtio_pci_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-host-pci.c'))
+diff --git a/hw/virtio/virtio-vsock-sock.c b/hw/virtio/virtio-vsock-sock.c
+new file mode 100644
+index 0000000..38efe50
+--- /dev/null
++++ b/hw/virtio/virtio-vsock-sock.c
+@@ -0,0 +1,1076 @@
++/*
++ * virtio-vsock with the datapath inside QEMU and a stream-socket host side
++ *
++ * vhost-vsock-pci needs the Linux kernel's vhost-vsock. This device runs the
++ * virtio-vsock transport in QEMU instead, so it works on any host (Windows
++ * included). The host side is a listening socket, TCP (host-port=, on
++ * host-addr=, 127.0.0.1 by default) and/or AF_UNIX (uds-path=), speaking
++ * Firecracker's hybrid-vsock protocol:
++ *
++ *   host -> QEMU:  "CONNECT <guest port>\n"
++ *   QEMU -> host:  "OK <host port>\n"      once the guest accepted
++ *   then a raw byte stream in both directions; the host connection is
++ *   closed when the guest refuses (RST) or does not answer.
++ *
++ * With uds-path=, a guest connection to host port P goes to the Unix
++ * socket "<uds-path>_<P>" (Firecracker's convention); otherwise the guest
++ * cannot connect to the host (RST).
++ *
++ * Credit: the host side advertises buf-alloc (4 MiB by default) and never
++ * caps it to a socket buffer; QEMU buffers what the host socket does not
++ * take yet. Host-to-guest data respects the guest's buf_alloc/fwd_cnt, and
++ * QEMU asks the guest for a credit update (CREDIT_REQUEST) when its credit
++ * runs low, since an iOS guest only volunteers one when its 512 KiB window
++ * is nearly full.
++ *
++ * Queues are 256 entries: an iOS guest's virtio driver assumes page-aligned
++ * rings (see include/hw/virtio/vhost-vsock-common.h).
++ *
++ * Copyright (c) 2026 vphone contributors
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or
++ * (at your option) any later version.  See the COPYING file in the
++ * top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-types-sockets.h"
++#include "qemu/error-report.h"
++#include "qemu/iov.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/queue.h"
++#include "qemu/timer.h"
++#include "hw/qdev-properties.h"
++#include "hw/virtio/virtio.h"
++#include "hw/virtio/virtio-pci.h"
++#include "io/channel-socket.h"
++#include "io/net-listener.h"
++#include "migration/vmstate.h"
++#include "standard-headers/linux/virtio_ids.h"
++#include "standard-headers/linux/virtio_vsock.h"
++#include "qom/object.h"
++
++#define TYPE_VIRTIO_VSOCK_SOCK "virtio-vsock-sock-device"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOVSockSock, VIRTIO_VSOCK_SOCK)
++
++#define VSOCK_QUEUE_SIZE        256
++#define VSOCK_CID_HOST          2
++#define VSOCK_HDR_SIZE          sizeof(struct virtio_vsock_hdr)
++#define VSOCK_MAX_PAYLOAD       (64 * 1024)
++#define VSOCK_LINE_MAX          64
++#define VSOCK_LINE_TIMEOUT_MS   10000
++#define VSOCK_CONNECT_TIMEOUT_MS 10000
++#define VSOCK_CREDIT_RETRY_MS   200
++#define VSOCK_FIRST_HOST_PORT   49152u
++
++typedef enum {
++    VS_AWAIT_LINE,      /* host connected, waiting for "CONNECT <port>\n" */
++    VS_CONNECTING,      /* REQUEST sent to the guest */
++    VS_CONNECTED,
++} VSockConnState;
++
++typedef struct VSockPkt {
++    struct virtio_vsock_hdr hdr;
++} VSockPkt;
++
++typedef struct VSockConn VSockConn;
++
++struct VirtIOVSockSock {
++    VirtIODevice parent_obj;
++
++    VirtQueue *rx_vq;
++    VirtQueue *tx_vq;
++    VirtQueue *event_vq;
++
++    /* properties */
++    uint64_t guest_cid;
++    char *host_addr;
++    uint16_t host_port;
++    char *uds_path;
++    uint32_t buf_alloc;
++
++    QIONetListener *tcp_listener;
++    QIONetListener *uds_listener;
++    QTAILQ_HEAD(, VSockConn) conns;
++    GQueue ctrl;                /* header-only packets for the guest */
++    uint32_t next_port;
++    bool pumping;
++    uint8_t buf[VSOCK_MAX_PAYLOAD];
++};
++
++struct VSockConn {
++    QTAILQ_ENTRY(VSockConn) next;
++    VirtIOVSockSock *s;
++    QIOChannelSocket *sioc;
++    QIOChannel *ioc;
++    guint watch;
++    GIOCondition watch_cond;
++    QEMUTimer *timer;
++    VSockConnState state;
++    bool dead;
++
++    uint32_t guest_port;
++    uint32_t host_port;
++
++    char line[VSOCK_LINE_MAX];
++    size_t line_len;
++
++    /* guest -> host */
++    GByteArray *out;
++    size_t out_off;
++    size_t out_nocredit;        /* leading bytes of out that are not guest data */
++    uint32_t fwd_cnt;           /* guest bytes written to the host socket */
++    uint32_t last_adv_fwd;      /* fwd_cnt last told to the guest */
++    uint32_t peer_shut;         /* VIRTIO_VSOCK_SHUTDOWN_* from the guest */
++    bool host_wr_shut;
++
++    /* host -> guest */
++    uint32_t tx_cnt;
++    uint32_t peer_buf_alloc;
++    uint32_t peer_fwd_cnt;
++    bool readable;              /* the host socket may have data */
++    bool host_eof;
++    bool credit_req_pending;
++};
++
++/* VPHONE_VSOCK_DEBUG=1: log connections and packets on stderr */
++static bool vsock_debug(void)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *e = getenv("VPHONE_VSOCK_DEBUG");
++        on = e && *e && strcmp(e, "0") != 0;
++    }
++    return on;
++}
++
++#define VDBG(fmt, ...) do { \
++        if (vsock_debug()) { \
++            fprintf(stderr, "virtio-vsock: " fmt "\n", ## __VA_ARGS__); \
++        } \
++    } while (0)
++
++static void vsock_pump(VirtIOVSockSock *s);
++static void conn_update_watch(VSockConn *c);
++
++static bool vsock_driver_ok(VirtIOVSockSock *s)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++
++    return vdev->status & VIRTIO_CONFIG_S_DRIVER_OK;
++}
++
++static uint32_t conn_credit(VSockConn *c)
++{
++    uint32_t in_flight = c->tx_cnt - c->peer_fwd_cnt;
++
++    return in_flight >= c->peer_buf_alloc ? 0 : c->peer_buf_alloc - in_flight;
++}
++
++static void vsock_fill_hdr(VirtIOVSockSock *s, struct virtio_vsock_hdr *hdr,
++                           uint32_t host_port, uint32_t guest_port,
++                           uint16_t op, uint32_t flags, uint32_t len,
++                           uint32_t fwd_cnt)
++{
++    hdr->src_cid = cpu_to_le64(VSOCK_CID_HOST);
++    hdr->dst_cid = cpu_to_le64(s->guest_cid);
++    hdr->src_port = cpu_to_le32(host_port);
++    hdr->dst_port = cpu_to_le32(guest_port);
++    hdr->len = cpu_to_le32(len);
++    hdr->type = cpu_to_le16(VIRTIO_VSOCK_TYPE_STREAM);
++    hdr->op = cpu_to_le16(op);
++    hdr->flags = cpu_to_le32(flags);
++    hdr->buf_alloc = cpu_to_le32(s->buf_alloc);
++    hdr->fwd_cnt = cpu_to_le32(fwd_cnt);
++}
++
++static void vsock_queue_ctrl_ports(VirtIOVSockSock *s, uint32_t host_port,
++                                   uint32_t guest_port, uint16_t op,
++                                   uint32_t flags, uint32_t fwd_cnt)
++{
++    VSockPkt *pkt = g_new0(VSockPkt, 1);
++
++    VDBG("-> guest op %u flags %u host %u guest %u fwd %u", op, flags,
++         host_port, guest_port, fwd_cnt);
++    vsock_fill_hdr(s, &pkt->hdr, host_port, guest_port, op, flags, 0, fwd_cnt);
++    g_queue_push_tail(&s->ctrl, pkt);
++}
++
++static void conn_queue_ctrl(VSockConn *c, uint16_t op, uint32_t flags)
++{
++    vsock_queue_ctrl_ports(c->s, c->host_port, c->guest_port, op, flags,
++                           c->fwd_cnt);
++    c->last_adv_fwd = c->fwd_cnt;
++}
++
++static void conn_free_bh(void *opaque)
++{
++    VSockConn *c = opaque;
++
++    g_byte_array_free(c->out, true);
++    g_free(c);
++}
++
++/* Close the host side and forget the connection; @c stays readable until
++ * the main loop runs again (c->dead is set). */
++static void conn_destroy(VSockConn *c)
++{
++    VirtIOVSockSock *s = c->s;
++
++    if (c->dead) {
++        return;
++    }
++    VDBG("close host %u <-> guest %u", c->host_port, c->guest_port);
++    c->dead = true;
++    if (c->watch) {
++        g_source_remove(c->watch);
++        c->watch = 0;
++    }
++    timer_free(c->timer);
++    c->timer = NULL;
++    /*
++     * shutdown() first: on Windows the close alone did not reach the peer
++     * (no FIN) while another handle to the socket stayed open.
++     */
++    qio_channel_shutdown(c->ioc, QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
++    qio_channel_close(c->ioc, NULL);
++    object_unref(OBJECT(c->sioc));
++    QTAILQ_REMOVE(&s->conns, c, next);
++    aio_bh_schedule_oneshot(qemu_get_aio_context(), conn_free_bh, c);
++}
++
++/* Tell the guest the connection is gone (if it knows it), then drop it. */
++static void conn_reset(VSockConn *c)
++{
++    if (c->state != VS_AWAIT_LINE) {
++        conn_queue_ctrl(c, VIRTIO_VSOCK_OP_RST, 0);
++    }
++    conn_destroy(c);
++}
++
++static void conn_set_timer(VSockConn *c, int64_t ms)
++{
++    timer_mod(c->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ms);
++}
++
++/* Both directions are done: the guest closed (or shut its send side after
++ * the host's EOF) and every guest byte reached the host. */
++static void conn_maybe_finish(VSockConn *c)
++{
++    bool out_empty = c->out_off >= c->out->len;
++    bool done = c->peer_shut == (VIRTIO_VSOCK_SHUTDOWN_RCV |
++                                 VIRTIO_VSOCK_SHUTDOWN_SEND) ||
++                (c->host_eof && (c->peer_shut & VIRTIO_VSOCK_SHUTDOWN_SEND));
++
++    if (!c->dead && c->state == VS_CONNECTED && done && out_empty) {
++        conn_reset(c);
++    }
++}
++
++/* Write buffered guest data to the host socket. */
++static void conn_flush(VSockConn *c)
++{
++    VirtIOVSockSock *s = c->s;
++
++    while (c->out_off < c->out->len) {
++        ssize_t n = qio_channel_write(c->ioc,
++                                      (char *)c->out->data + c->out_off,
++                                      c->out->len - c->out_off, NULL);
++        size_t credited;
++
++        if (n == QIO_CHANNEL_ERR_BLOCK) {
++            break;
++        }
++        if (n < 0) {
++            conn_reset(c);
++            return;
++        }
++        c->out_off += n;
++        credited = n;
++        if (c->out_nocredit) {
++            size_t skip = MIN(c->out_nocredit, credited);
++            c->out_nocredit -= skip;
++            credited -= skip;
++        }
++        c->fwd_cnt += credited;
++    }
++
++    if (c->out_off >= c->out->len) {
++        g_byte_array_set_size(c->out, 0);
++        c->out_off = 0;
++        if ((c->peer_shut & VIRTIO_VSOCK_SHUTDOWN_SEND) && !c->host_wr_shut &&
++            c->state == VS_CONNECTED) {
++            c->host_wr_shut = true;
++            qio_channel_shutdown(c->ioc, QIO_CHANNEL_SHUTDOWN_WRITE, NULL);
++        }
++    } else if (c->out_off >= 1024 * 1024) {
++        g_byte_array_remove_range(c->out, 0, c->out_off);
++        c->out_off = 0;
++    }
++
++    if (c->state == VS_CONNECTED &&
++        c->fwd_cnt - c->last_adv_fwd >= MAX(s->buf_alloc / 4, 1)) {
++        conn_queue_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++    }
++    conn_maybe_finish(c);
++    if (!c->dead) {
++        conn_update_watch(c);
++    }
++}
++
++static void conn_out_append(VSockConn *c, const void *data, size_t len,
++                            bool credit)
++{
++    if (!credit) {
++        /* only used before any guest data is queued */
++        c->out_nocredit += len;
++    }
++    g_byte_array_append(c->out, data, len);
++}
++
++static bool vsock_port_in_use(VirtIOVSockSock *s, uint32_t host_port,
++                              uint32_t guest_port)
++{
++    VSockConn *c;
++
++    QTAILQ_FOREACH(c, &s->conns, next) {
++        if (c->state != VS_AWAIT_LINE && c->host_port == host_port &&
++            c->guest_port == guest_port) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/* Read the "CONNECT <port>\n" line one byte at a time (nothing after it is
++ * consumed before the guest accepted). */
++static void conn_read_line(VSockConn *c)
++{
++    VirtIOVSockSock *s = c->s;
++    unsigned long port;
++    char *end;
++
++    for (;;) {
++        char ch;
++        ssize_t n = qio_channel_read(c->ioc, &ch, 1, NULL);
++
++        if (n == QIO_CHANNEL_ERR_BLOCK) {
++            return;
++        }
++        if (n <= 0) {
++            conn_destroy(c);
++            return;
++        }
++        if (ch == '\n') {
++            break;
++        }
++        if (c->line_len >= sizeof(c->line) - 1) {
++            conn_destroy(c);
++            return;
++        }
++        c->line[c->line_len++] = ch;
++    }
++    c->line[c->line_len] = '\0';
++    if (c->line_len && c->line[c->line_len - 1] == '\r') {
++        c->line[--c->line_len] = '\0';
++    }
++
++    if (strncmp(c->line, "CONNECT ", 8) != 0) {
++        conn_destroy(c);
++        return;
++    }
++    errno = 0;
++    port = strtoul(c->line + 8, &end, 10);
++    if (errno || end == c->line + 8 || *end || port > UINT32_MAX) {
++        conn_destroy(c);
++        return;
++    }
++    if (!vsock_driver_ok(s)) {
++        /* no guest driver: nobody can accept */
++        conn_destroy(c);
++        return;
++    }
++
++    c->guest_port = port;
++    do {
++        c->host_port = s->next_port++;
++        if (s->next_port == 0 || s->next_port == UINT32_MAX) {
++            s->next_port = VSOCK_FIRST_HOST_PORT;
++        }
++    } while (vsock_port_in_use(s, c->host_port, c->guest_port));
++
++    c->state = VS_CONNECTING;
++    conn_queue_ctrl(c, VIRTIO_VSOCK_OP_REQUEST, 0);
++    conn_set_timer(c, VSOCK_CONNECT_TIMEOUT_MS);
++    vsock_pump(s);
++}
++
++static gboolean conn_io(QIOChannel *ioc, GIOCondition cond, gpointer opaque)
++{
++    VSockConn *c = opaque;
++    VirtIOVSockSock *s = c->s;
++
++    VDBG("io host %u: cond 0x%x state %d", c->host_port, cond, c->state);
++    /* one-shot watch: re-armed by conn_update_watch() below */
++    c->watch = 0;
++    c->watch_cond = 0;
++
++    if (cond & (G_IO_OUT | G_IO_ERR | G_IO_HUP)) {
++        conn_flush(c);
++        if (c->dead) {
++            return G_SOURCE_REMOVE;
++        }
++    }
++    if (cond & (G_IO_IN | G_IO_ERR | G_IO_HUP)) {
++        if (c->state == VS_AWAIT_LINE) {
++            conn_read_line(c);
++        } else if (c->state == VS_CONNECTED) {
++            c->readable = true;
++            vsock_pump(s);
++        }
++    }
++    if (!c->dead) {
++        conn_update_watch(c);
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void conn_update_watch(VSockConn *c)
++{
++    GIOCondition cond = 0;
++
++    if (c->dead) {
++        return;
++    }
++    if (c->state == VS_AWAIT_LINE ||
++        (c->state == VS_CONNECTED && !c->readable && !c->host_eof)) {
++        cond |= G_IO_IN;
++    }
++    if (c->out_off < c->out->len) {
++        cond |= G_IO_OUT;
++    }
++    if (cond == c->watch_cond && c->watch) {
++        return;
++    }
++    if (c->watch) {
++        g_source_remove(c->watch);
++        c->watch = 0;
++    }
++    c->watch_cond = cond;
++    if (cond) {
++        c->watch = qio_channel_add_watch(c->ioc, cond, conn_io, c, NULL);
++    }
++}
++
++static void conn_timer_cb(void *opaque)
++{
++    VSockConn *c = opaque;
++    VirtIOVSockSock *s = c->s;
++
++    switch (c->state) {
++    case VS_AWAIT_LINE:
++        conn_destroy(c);
++        break;
++    case VS_CONNECTING:
++        warn_report("virtio-vsock: guest did not answer a connection to "
++                    "port %u", c->guest_port);
++        conn_reset(c);
++        break;
++    case VS_CONNECTED:
++        /* still out of credit: ask again */
++        if (c->readable && !c->host_eof && conn_credit(c) == 0) {
++            conn_queue_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_REQUEST, 0);
++            c->credit_req_pending = true;
++            conn_set_timer(c, VSOCK_CREDIT_RETRY_MS);
++        }
++        break;
++    }
++    vsock_pump(s);
++}
++
++static VSockConn *conn_new(VirtIOVSockSock *s, QIOChannelSocket *sioc)
++{
++    VSockConn *c = g_new0(VSockConn, 1);
++
++    c->s = s;
++    c->sioc = sioc;
++    object_ref(OBJECT(sioc));
++    c->ioc = QIO_CHANNEL(sioc);
++    qio_channel_set_name(c->ioc, "virtio-vsock-sock-conn");
++    qio_channel_set_blocking(c->ioc, false, NULL);
++    c->out = g_byte_array_new();
++    c->timer = timer_new_ms(QEMU_CLOCK_REALTIME, conn_timer_cb, c);
++    QTAILQ_INSERT_TAIL(&s->conns, c, next);
++    return c;
++}
++
++static void vsock_new_client(QIONetListener *listener, QIOChannelSocket *sioc,
++                             gpointer opaque)
++{
++    VirtIOVSockSock *s = opaque;
++    VSockConn *c = conn_new(s, sioc);
++
++    VDBG("host client accepted");
++
++    if (sioc->localAddr.ss_family != AF_UNIX) {
++        qio_channel_set_delay(c->ioc, false);
++    }
++    c->state = VS_AWAIT_LINE;
++    conn_set_timer(c, VSOCK_LINE_TIMEOUT_MS);
++    conn_update_watch(c);
++}
++
++/* Fill the guest's receive queue: control packets first, then host data. */
++static void vsock_pump(VirtIOVSockSock *s)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    bool notify = false;
++
++    if (s->pumping || !vsock_driver_ok(s)) {
++        return;
++    }
++    s->pumping = true;
++
++    for (;;) {
++        VirtQueueElement *elem;
++        VSockConn *c, *pick = NULL;
++        size_t in_size, max;
++        ssize_t n;
++
++        if (!g_queue_is_empty(&s->ctrl)) {
++            VSockPkt *pkt;
++
++            elem = virtqueue_pop(s->rx_vq, sizeof(VirtQueueElement));
++            if (!elem) {
++                break;
++            }
++            pkt = g_queue_pop_head(&s->ctrl);
++            iov_from_buf(elem->in_sg, elem->in_num, 0, &pkt->hdr,
++                         VSOCK_HDR_SIZE);
++            virtqueue_push(s->rx_vq, elem, VSOCK_HDR_SIZE);
++            g_free(elem);
++            g_free(pkt);
++            notify = true;
++            continue;
++        }
++
++        QTAILQ_FOREACH(c, &s->conns, next) {
++            if (c->state != VS_CONNECTED || !c->readable || c->host_eof) {
++                continue;
++            }
++            if (conn_credit(c) == 0) {
++                if (!c->credit_req_pending) {
++                    conn_queue_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_REQUEST, 0);
++                    c->credit_req_pending = true;
++                }
++                /* conn_timer_cb() asks again until credit arrives */
++                if (!timer_pending(c->timer)) {
++                    conn_set_timer(c, VSOCK_CREDIT_RETRY_MS);
++                }
++                continue;
++            }
++            pick = c;
++            break;
++        }
++        if (!pick) {
++            if (!g_queue_is_empty(&s->ctrl)) {
++                continue;
++            }
++            break;
++        }
++        c = pick;
++
++        elem = virtqueue_pop(s->rx_vq, sizeof(VirtQueueElement));
++        if (!elem) {
++            break;
++        }
++        in_size = iov_size(elem->in_sg, elem->in_num);
++        if (in_size <= VSOCK_HDR_SIZE) {
++            virtqueue_detach_element(s->rx_vq, elem, 0);
++            g_free(elem);
++            virtio_error(vdev, "virtio-vsock: receive buffer too small");
++            break;
++        }
++        max = MIN(MIN(in_size - VSOCK_HDR_SIZE, conn_credit(c)),
++                  sizeof(s->buf));
++        n = qio_channel_read(c->ioc, (char *)s->buf, max, NULL);
++        if (n <= 0) {
++            virtqueue_unpop(s->rx_vq, elem, 0);
++            g_free(elem);
++            if (n == QIO_CHANNEL_ERR_BLOCK) {
++                c->readable = false;
++                conn_update_watch(c);
++            } else if (n == 0) {
++                c->host_eof = true;
++                c->readable = false;
++                conn_queue_ctrl(c, VIRTIO_VSOCK_OP_SHUTDOWN,
++                                VIRTIO_VSOCK_SHUTDOWN_SEND);
++                conn_maybe_finish(c);
++                conn_update_watch(c);
++            } else {
++                conn_reset(c);
++            }
++            continue;
++        } else {
++            struct virtio_vsock_hdr hdr;
++
++            vsock_fill_hdr(s, &hdr, c->host_port, c->guest_port,
++                           VIRTIO_VSOCK_OP_RW, 0, n, c->fwd_cnt);
++            c->last_adv_fwd = c->fwd_cnt;
++            iov_from_buf(elem->in_sg, elem->in_num, 0, &hdr, VSOCK_HDR_SIZE);
++            iov_from_buf(elem->in_sg, elem->in_num, VSOCK_HDR_SIZE,
++                         s->buf, n);
++            virtqueue_push(s->rx_vq, elem, VSOCK_HDR_SIZE + n);
++            g_free(elem);
++            notify = true;
++            c->tx_cnt += n;
++
++            /* iOS volunteers a credit update only near the end of its
++             * window: ask early so the stream does not stall */
++            if (!c->credit_req_pending &&
++                conn_credit(c) < c->peer_buf_alloc / 4) {
++                conn_queue_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_REQUEST, 0);
++                c->credit_req_pending = true;
++            }
++            /* round robin between connections */
++            QTAILQ_REMOVE(&s->conns, c, next);
++            QTAILQ_INSERT_TAIL(&s->conns, c, next);
++        }
++    }
++
++    s->pumping = false;
++    if (notify) {
++        virtio_notify(vdev, s->rx_vq);
++    }
++}
++
++static VSockConn *vsock_find(VirtIOVSockSock *s, uint32_t host_port,
++                             uint32_t guest_port)
++{
++    VSockConn *c;
++
++    QTAILQ_FOREACH(c, &s->conns, next) {
++        if (c->state != VS_AWAIT_LINE && c->host_port == host_port &&
++            c->guest_port == guest_port) {
++            return c;
++        }
++    }
++    return NULL;
++}
++
++/* A guest connection to host port @port: only with uds-path=. */
++static void vsock_guest_connect(VirtIOVSockSock *s,
++                                const struct virtio_vsock_hdr *hdr,
++                                uint32_t host_port, uint32_t guest_port)
++{
++    QIOChannelSocket *sioc;
++    SocketAddress addr = { .type = SOCKET_ADDRESS_TYPE_UNIX };
++    g_autofree char *path = NULL;
++    VSockConn *c;
++
++    if (!s->uds_path) {
++        vsock_queue_ctrl_ports(s, host_port, guest_port, VIRTIO_VSOCK_OP_RST,
++                               0, 0);
++        return;
++    }
++    path = g_strdup_printf("%s_%u", s->uds_path, host_port);
++    addr.u.q_unix.path = path;
++    sioc = qio_channel_socket_new();
++    if (qio_channel_socket_connect_sync(sioc, &addr, NULL) < 0) {
++        object_unref(OBJECT(sioc));
++        vsock_queue_ctrl_ports(s, host_port, guest_port, VIRTIO_VSOCK_OP_RST,
++                               0, 0);
++        return;
++    }
++    c = conn_new(s, sioc);
++    object_unref(OBJECT(sioc));
++    c->state = VS_CONNECTED;
++    c->host_port = host_port;
++    c->guest_port = guest_port;
++    c->peer_buf_alloc = le32_to_cpu(hdr->buf_alloc);
++    c->peer_fwd_cnt = le32_to_cpu(hdr->fwd_cnt);
++    conn_queue_ctrl(c, VIRTIO_VSOCK_OP_RESPONSE, 0);
++    conn_update_watch(c);
++}
++
++static void vsock_handle_pkt(VirtIOVSockSock *s, VirtQueueElement *elem,
++                             const struct virtio_vsock_hdr *hdr)
++{
++    uint64_t src_cid = le64_to_cpu(hdr->src_cid);
++    uint64_t dst_cid = le64_to_cpu(hdr->dst_cid);
++    uint32_t guest_port = le32_to_cpu(hdr->src_port);
++    uint32_t host_port = le32_to_cpu(hdr->dst_port);
++    uint32_t len = le32_to_cpu(hdr->len);
++    uint16_t op = le16_to_cpu(hdr->op);
++    uint16_t type = le16_to_cpu(hdr->type);
++    VSockConn *c;
++
++    VDBG("<- guest op %u flags %u len %u guest %u host %u buf_alloc %u fwd %u",
++         op, le32_to_cpu(hdr->flags), len, guest_port, host_port,
++         le32_to_cpu(hdr->buf_alloc), le32_to_cpu(hdr->fwd_cnt));
++    if (dst_cid != VSOCK_CID_HOST || src_cid != s->guest_cid) {
++        return;
++    }
++    c = vsock_find(s, host_port, guest_port);
++    if (type != VIRTIO_VSOCK_TYPE_STREAM) {
++        if (op != VIRTIO_VSOCK_OP_RST) {
++            vsock_queue_ctrl_ports(s, host_port, guest_port,
++                                   VIRTIO_VSOCK_OP_RST, 0, 0);
++        }
++        return;
++    }
++    if (!c) {
++        if (op == VIRTIO_VSOCK_OP_REQUEST) {
++            vsock_guest_connect(s, hdr, host_port, guest_port);
++        } else if (op != VIRTIO_VSOCK_OP_RST) {
++            vsock_queue_ctrl_ports(s, host_port, guest_port,
++                                   VIRTIO_VSOCK_OP_RST, 0, 0);
++        }
++        return;
++    }
++
++    c->peer_buf_alloc = le32_to_cpu(hdr->buf_alloc);
++    c->peer_fwd_cnt = le32_to_cpu(hdr->fwd_cnt);
++    c->credit_req_pending = false;
++
++    switch (op) {
++    case VIRTIO_VSOCK_OP_RESPONSE:
++        if (c->state == VS_CONNECTING) {
++            char ok[32];
++            int n = snprintf(ok, sizeof(ok), "OK %u\n", c->host_port);
++
++            c->state = VS_CONNECTED;
++            timer_del(c->timer);
++            conn_out_append(c, ok, n, false);
++            conn_flush(c);
++        } else {
++            conn_reset(c);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_RST:
++        conn_destroy(c);
++        break;
++    case VIRTIO_VSOCK_OP_SHUTDOWN:
++        c->peer_shut |= le32_to_cpu(hdr->flags) &
++                        (VIRTIO_VSOCK_SHUTDOWN_RCV | VIRTIO_VSOCK_SHUTDOWN_SEND);
++        conn_flush(c);
++        break;
++    case VIRTIO_VSOCK_OP_RW:
++        if (c->state != VS_CONNECTED) {
++            conn_reset(c);
++            break;
++        }
++        if (len) {
++            size_t old = c->out->len;
++            size_t got;
++
++            if (c->out->len - c->out_off > (size_t)s->buf_alloc * 2) {
++                error_report("virtio-vsock: guest overran its credit on "
++                             "port %u", c->guest_port);
++                conn_reset(c);
++                break;
++            }
++            g_byte_array_set_size(c->out, old + len);
++            got = iov_to_buf(elem->out_sg, elem->out_num, VSOCK_HDR_SIZE,
++                             c->out->data + old, len);
++            g_byte_array_set_size(c->out, old + got);
++            conn_flush(c);
++        }
++        break;
++    case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
++        break;
++    case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
++        conn_queue_ctrl(c, VIRTIO_VSOCK_OP_CREDIT_UPDATE, 0);
++        break;
++    case VIRTIO_VSOCK_OP_REQUEST:
++    default:
++        conn_reset(c);
++        break;
++    }
++}
++
++static void vsock_handle_tx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VirtIOVSockSock *s = VIRTIO_VSOCK_SOCK(vdev);
++    VirtQueueElement *elem;
++    bool pushed = false;
++
++    while ((elem = virtqueue_pop(vq, sizeof(VirtQueueElement)))) {
++        struct virtio_vsock_hdr hdr;
++
++        if (iov_to_buf(elem->out_sg, elem->out_num, 0, &hdr,
++                       VSOCK_HDR_SIZE) == VSOCK_HDR_SIZE) {
++            vsock_handle_pkt(s, elem, &hdr);
++        }
++        virtqueue_push(vq, elem, 0);
++        g_free(elem);
++        pushed = true;
++    }
++    if (pushed) {
++        virtio_notify(vdev, vq);
++    }
++    /* credit updates and replies, and data the new credit lets through */
++    vsock_pump(s);
++}
++
++static void vsock_handle_rx(VirtIODevice *vdev, VirtQueue *vq)
++{
++    vsock_pump(VIRTIO_VSOCK_SOCK(vdev));
++}
++
++static void vsock_handle_event(VirtIODevice *vdev, VirtQueue *vq)
++{
++    /* the guest gives buffers for TRANSPORT_RESET, which we never send */
++}
++
++static void vsock_drop_all(VirtIOVSockSock *s)
++{
++    VSockConn *c, *tmp;
++
++    QTAILQ_FOREACH_SAFE(c, &s->conns, next, tmp) {
++        conn_destroy(c);
++    }
++    g_queue_clear_full(&s->ctrl, g_free);
++}
++
++static void vsock_get_config(VirtIODevice *vdev, uint8_t *config)
++{
++    VirtIOVSockSock *s = VIRTIO_VSOCK_SOCK(vdev);
++    struct virtio_vsock_config cfg = {};
++
++    stq_le_p(&cfg.guest_cid, s->guest_cid);
++    memcpy(config, &cfg, sizeof(cfg));
++}
++
++static uint64_t vsock_get_features(VirtIODevice *vdev, uint64_t features,
++                                   Error **errp)
++{
++    return features;
++}
++
++static void vsock_pump_bh(void *opaque)
++{
++    vsock_pump(opaque);
++}
++
++static int vsock_set_status(VirtIODevice *vdev, uint8_t status)
++{
++    VirtIOVSockSock *s = VIRTIO_VSOCK_SOCK(vdev);
++
++    if (!(status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        vsock_drop_all(s);
++    } else if (!vsock_driver_ok(s)) {
++        /* vdev->status takes the new value after this returns */
++        aio_bh_schedule_oneshot(qemu_get_aio_context(), vsock_pump_bh, s);
++    }
++    return 0;
++}
++
++static void vsock_reset(VirtIODevice *vdev)
++{
++    vsock_drop_all(VIRTIO_VSOCK_SOCK(vdev));
++}
++
++static bool vsock_listen(VirtIOVSockSock *s, QIONetListener **lp,
++                         SocketAddress *addr, const char *name, Error **errp)
++{
++    QIONetListener *l = qio_net_listener_new();
++
++    qio_net_listener_set_name(l, name);
++    if (qio_net_listener_open_sync(l, addr, 8, errp) < 0) {
++        object_unref(OBJECT(l));
++        return false;
++    }
++    qio_net_listener_set_client_func(l, vsock_new_client, s, NULL);
++    *lp = l;
++    return true;
++}
++
++static void vsock_device_realize(DeviceState *dev, Error **errp)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOVSockSock *s = VIRTIO_VSOCK_SOCK(dev);
++
++    if (s->guest_cid <= 2 || s->guest_cid > UINT32_MAX) {
++        error_setg(errp, "guest-cid property must be a 32-bit number "
++                   "greater than 2");
++        return;
++    }
++    if (s->buf_alloc < 4096) {
++        error_setg(errp, "buf-alloc must be at least 4096");
++        return;
++    }
++
++    QTAILQ_INIT(&s->conns);
++    g_queue_init(&s->ctrl);
++    s->next_port = VSOCK_FIRST_HOST_PORT;
++
++    if (s->host_port) {
++        g_autofree char *port = g_strdup_printf("%u", s->host_port);
++        SocketAddress addr = {
++            .type = SOCKET_ADDRESS_TYPE_INET,
++            .u.inet = {
++                .host = s->host_addr ? s->host_addr : (char *)"127.0.0.1",
++                .port = port,
++            },
++        };
++
++        if (!vsock_listen(s, &s->tcp_listener, &addr,
++                          "virtio-vsock-sock-tcp", errp)) {
++            return;
++        }
++    }
++    if (s->uds_path) {
++        SocketAddress addr = {
++            .type = SOCKET_ADDRESS_TYPE_UNIX,
++            .u.q_unix = { .path = s->uds_path },
++        };
++
++        if (!vsock_listen(s, &s->uds_listener, &addr,
++                          "virtio-vsock-sock-unix", errp)) {
++            if (s->tcp_listener) {
++                qio_net_listener_disconnect(s->tcp_listener);
++                object_unref(OBJECT(s->tcp_listener));
++                s->tcp_listener = NULL;
++            }
++            return;
++        }
++    }
++
++    virtio_init(vdev, VIRTIO_ID_VSOCK, sizeof(struct virtio_vsock_config));
++    s->rx_vq = virtio_add_queue(vdev, VSOCK_QUEUE_SIZE, vsock_handle_rx);
++    s->tx_vq = virtio_add_queue(vdev, VSOCK_QUEUE_SIZE, vsock_handle_tx);
++    s->event_vq = virtio_add_queue(vdev, VSOCK_QUEUE_SIZE, vsock_handle_event);
++}
++
++static void vsock_device_unrealize(DeviceState *dev)
++{
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++    VirtIOVSockSock *s = VIRTIO_VSOCK_SOCK(dev);
++
++    if (s->tcp_listener) {
++        qio_net_listener_disconnect(s->tcp_listener);
++        object_unref(OBJECT(s->tcp_listener));
++        s->tcp_listener = NULL;
++    }
++    if (s->uds_listener) {
++        qio_net_listener_disconnect(s->uds_listener);
++        object_unref(OBJECT(s->uds_listener));
++        s->uds_listener = NULL;
++    }
++    vsock_drop_all(s);
++    virtio_delete_queue(s->rx_vq);
++    virtio_delete_queue(s->tx_vq);
++    virtio_delete_queue(s->event_vq);
++    virtio_cleanup(vdev);
++}
++
++static const VMStateDescription vmstate_virtio_vsock_sock = {
++    .name = "virtio-vsock-sock",
++    .unmigratable = 1,
++};
++
++static const Property vsock_properties[] = {
++    DEFINE_PROP_UINT64("guest-cid", VirtIOVSockSock, guest_cid, 0),
++    DEFINE_PROP_STRING("host-addr", VirtIOVSockSock, host_addr),
++    DEFINE_PROP_UINT16("host-port", VirtIOVSockSock, host_port, 0),
++    DEFINE_PROP_STRING("uds-path", VirtIOVSockSock, uds_path),
++    DEFINE_PROP_UINT32("buf-alloc", VirtIOVSockSock, buf_alloc, 4 * 1024 * 1024),
++};
++
++static void vsock_device_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, vsock_properties);
++    dc->vmsd = &vmstate_virtio_vsock_sock;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    vdc->realize = vsock_device_realize;
++    vdc->unrealize = vsock_device_unrealize;
++    vdc->get_features = vsock_get_features;
++    vdc->get_config = vsock_get_config;
++    vdc->set_status = vsock_set_status;
++    vdc->reset = vsock_reset;
++}
++
++static const TypeInfo vsock_device_info = {
++    .name = TYPE_VIRTIO_VSOCK_SOCK,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(VirtIOVSockSock),
++    .class_init = vsock_device_class_init,
++};
++
++/* PCI proxy: virtio-vsock-sock-pci, and virtio-vsock-uds-pci (the name of
++ * the equivalent device on qemu-vphone's vsock-uds branch, which
++ * vphone-linux's run-vphone.sh looks for). */
++
++typedef struct VirtIOVSockSockPCI {
++    VirtIOPCIProxy parent_obj;
++    VirtIOVSockSock vdev;
++} VirtIOVSockSockPCI;
++
++static const Property vsock_pci_properties[] = {
++    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 3),
++};
++
++static void vsock_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
++{
++    VirtIOVSockSockPCI *dev = container_of(vpci_dev, VirtIOVSockSockPCI,
++                                           parent_obj);
++
++    virtio_pci_force_virtio_1(vpci_dev);
++    qdev_realize(DEVICE(&dev->vdev), BUS(&vpci_dev->bus), errp);
++}
++
++static void vsock_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
++    PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
++
++    k->realize = vsock_pci_realize;
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    device_class_set_props(dc, vsock_pci_properties);
++    pcidev_k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
++    pcidev_k->device_id = PCI_DEVICE_ID_VIRTIO_VSOCK;
++    pcidev_k->revision = 0x00;
++    pcidev_k->class_id = PCI_CLASS_COMMUNICATION_OTHER;
++}
++
++static void vsock_pci_instance_init(Object *obj)
++{
++    VirtIOVSockSockPCI *dev = container_of(VIRTIO_PCI(obj),
++                                           VirtIOVSockSockPCI, parent_obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_VSOCK_SOCK);
++}
++
++static const VirtioPCIDeviceTypeInfo vsock_sock_pci_info = {
++    .base_name     = "virtio-vsock-sock-pci-base",
++    .generic_name  = "virtio-vsock-sock-pci",
++    .instance_size = sizeof(VirtIOVSockSockPCI),
++    .instance_init = vsock_pci_instance_init,
++    .class_init    = vsock_pci_class_init,
++};
++
++static const VirtioPCIDeviceTypeInfo vsock_uds_pci_info = {
++    .base_name     = "virtio-vsock-uds-pci-base",
++    .generic_name  = "virtio-vsock-uds-pci",
++    .instance_size = sizeof(VirtIOVSockSockPCI),
++    .instance_init = vsock_pci_instance_init,
++    .class_init    = vsock_pci_class_init,
++};
++
++static void virtio_vsock_sock_register(void)
++{
++    type_register_static(&vsock_device_info);
++    virtio_pci_types_register(&vsock_sock_pci_info);
++    virtio_pci_types_register(&vsock_uds_pci_info);
++}
++
++type_init(virtio_vsock_sock_register)
+-- 
+2.47.0.windows.2
+

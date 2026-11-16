@@ -1,0 +1,172 @@
+From 81877d5f48628e51710fb8822caf63a8b72fff34 Mon Sep 17 00:00:00 2001
+From: YahiaAngelo <yahia.mostafa.elsayed@gmail.com>
+Date: Wed, 11 Nov 2026 20:32:30 +0200
+Subject: [PATCH 3/8] vphone-ab: switch a code path live in one VM, for A/B
+ measurements
+
+VPHONE_AB_FILE=<path>: a thread reads the file twice a second; when its first
+character changes ('0'/'1'), vphone_ab_arm takes that value and every TB and
+every vCPU's TLB is flushed, so a code path that tests vphone_ab(<feature>)
+at translation or run time switches for the whole guest. VPHONE_AB_WHAT names
+the feature arm 1 switches; VPHONE_AB the starting arm.
+
+Comparing two boots is too noisy for few-percent effects on the iPhone guest
+(post-boot background work decays over 15+ minutes, and boots differ by more
+than the effect). Alternating the arms in ABBA order in one settled boot
+cancels that drift. First feature: asid_ng_off (the full flush on an ASID
+switch, as before VPHONE_ASID_NG): arm 1 cost +2.6% host cycles on an app
+workload (8 steps; resolution needs ~16 per arm).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N89PWg24VJrcxX3MuUo4uM
+---
+ accel/tcg/cputlb.c       |  3 +-
+ accel/tcg/meson.build    |  1 +
+ accel/tcg/vphone-ab.c    | 69 ++++++++++++++++++++++++++++++++++++++++
+ include/qemu/vphone-ab.h | 25 +++++++++++++++
+ 4 files changed, 97 insertions(+), 1 deletion(-)
+ create mode 100644 accel/tcg/vphone-ab.c
+ create mode 100644 include/qemu/vphone-ab.h
+
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index 97620f8..46055f1 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/vphone-ev.h"
++#include "qemu/vphone-ab.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/target-info.h"
+ #include "accel/tcg/cpu-ops.h"
+@@ -498,7 +499,7 @@ void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
+ 
+     vphone_ev(VEV_FLUSH_ASID);
+     assert_cpu_is_self(cpu);
+-    if (!vphone_asid_ng_on()) {
++    if (!vphone_asid_ng_on() || vphone_ab("asid_ng_off")) {
+         tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
+         return;
+     }
+diff --git a/accel/tcg/meson.build b/accel/tcg/meson.build
+index 52abe90..778773a 100644
+--- a/accel/tcg/meson.build
++++ b/accel/tcg/meson.build
+@@ -20,6 +20,7 @@ system_ss.add_all(tcg_ss)
+ 
+ system_ss.add(files(
+   'cputlb.c',
++  'vphone-ab.c',
+   'icount-common.c',
+   'monitor.c',
+   'tcg-accel-ops.c',
+diff --git a/accel/tcg/vphone-ab.c b/accel/tcg/vphone-ab.c
+new file mode 100644
+index 0000000..430006f
+--- /dev/null
++++ b/accel/tcg/vphone-ab.c
+@@ -0,0 +1,69 @@
++/*
++ * vphone-linux A/B switch (include/qemu/vphone-ab.h).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/vphone-ab.h"
++#include "qemu/thread.h"
++#include "hw/core/cpu.h"
++#include "exec/tb-flush.h"
++#include "exec/cputlb.h"
++
++int vphone_ab_arm;
++const char *vphone_ab_what;
++static char *vab_file;
++
++static void vab_tlb_flush(CPUState *cpu, run_on_cpu_data d)
++{
++    tlb_flush(cpu);
++}
++
++static void *vab_thread(void *opaque)
++{
++    for (;;) {
++        char c = 0;
++        FILE *f;
++
++        g_usleep(500 * 1000);
++        f = fopen(vab_file, "r");
++        if (!f) {
++            continue;
++        }
++        if (fread(&c, 1, 1, f) != 1) {
++            c = 0;
++        }
++        fclose(f);
++        if ((c == '0' || c == '1') && c - '0' != qatomic_read(&vphone_ab_arm)) {
++            CPUState *cpu;
++            struct timespec ts;
++
++            qatomic_set(&vphone_ab_arm, c - '0');
++            if (first_cpu) {
++                queue_tb_flush(first_cpu);
++                CPU_FOREACH(cpu) {
++                    async_run_on_cpu(cpu, vab_tlb_flush, RUN_ON_CPU_NULL);
++                }
++            }
++            clock_gettime(CLOCK_MONOTONIC, &ts);
++            fprintf(stderr, "vphone-ab arm=%d t=%ld.%03ld\n", c - '0', (long)ts.tv_sec,
++                    ts.tv_nsec / 1000000);
++        }
++    }
++    return NULL;
++}
++
++static void __attribute__((constructor)) vab_init(void)
++{
++    const char *e = getenv("VPHONE_AB_FILE");
++    const char *a = getenv("VPHONE_AB");
++    QemuThread th;
++
++    vphone_ab_arm = a && *a == '1';
++    vphone_ab_what = getenv("VPHONE_AB_WHAT");
++    if (!e || !*e) {
++        return;
++    }
++    vab_file = g_strdup(e);
++    qemu_thread_create(&th, "vphone-ab", vab_thread, NULL, QEMU_THREAD_DETACHED);
++}
+diff --git a/include/qemu/vphone-ab.h b/include/qemu/vphone-ab.h
+new file mode 100644
+index 0000000..cf00fd1
+--- /dev/null
++++ b/include/qemu/vphone-ab.h
+@@ -0,0 +1,25 @@
++/*
++ * vphone-linux A/B switch for measurements in one running VM (accel/tcg/vphone-ab.c).
++ * VPHONE_AB_FILE=<path>: a thread reads the file twice a second; when its first character
++ * changes ('0' or '1'), vphone_ab_arm takes that value, every translation is flushed and
++ * every vCPU's TLB with it, so code paths that test vphone_ab_arm at translation or run time
++ * switch for the whole guest. VPHONE_AB=<0|1> sets the starting arm. Off (arm 0, no thread)
++ * without VPHONE_AB_FILE. VPHONE_AB_WHAT=<feature> names the code path arm 1 switches
++ * (vphone_ab()): asid_ng_off (cputlb.c: full flush on an ASID switch, as before).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_VPHONE_AB_H
++#define QEMU_VPHONE_AB_H
++
++extern int vphone_ab_arm;
++extern const char *vphone_ab_what;
++
++/* Arm 1, and VPHONE_AB_WHAT names @feature: the code path under test is switched. */
++static inline bool vphone_ab(const char *feature)
++{
++    return __builtin_expect(vphone_ab_arm, 0) && vphone_ab_what &&
++           !strcmp(vphone_ab_what, feature);
++}
++
++#endif
+-- 
+2.47.0.windows.2
+

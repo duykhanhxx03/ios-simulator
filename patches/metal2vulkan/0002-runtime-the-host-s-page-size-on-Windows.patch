@@ -1,0 +1,38 @@
+From e39f1f668d4e3053b1a4c7518a0bd5b9951ac466 Mon Sep 17 00:00:00 2001
+From: virt-ios <virt-ios@localhost>
+Date: Sat, 14 Nov 2026 14:03:42 +0700
+Subject: [PATCH 2/2] runtime: the host's page size on Windows
+
+host_page answered None off Unix, so a device's importer refused host memory (Unsupported HostMemory, NotImplemented) though the driver has VK_EXT_external_memory_host. Windows' page is 4 KiB on x86-64 and arm64.
+
+Verified: on an RTX 5060 (driver 616.92, Windows 11) a no-copy buffer over a view of 64 scattered guest pages is imported by pointer and a blit's fills land in the guest's pages (vphone-win gpu-smoke).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/metal2vulkan-runtime/src/host_memory.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
+index 1957d12..0961c15 100644
+--- a/crates/metal2vulkan-runtime/src/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
+@@ -614,8 +614,15 @@ pub(super) fn host_page() -> Option<u64> {
+     u64::try_from(page).ok().filter(|&page| page > 0)
+ }
+ 
++/// The host's page size on Windows: 4 KiB on every architecture Windows runs on (x86-64 and
++/// arm64), as `GetSystemInfo`'s `dwPageSize` reports it.
++#[cfg(windows)]
++pub(super) fn host_page() -> Option<u64> {
++    Some(4096)
++}
++
+ /// The host's page size, where the runtime knows how to ask for it: not on this system.
+-#[cfg(not(unix))]
++#[cfg(not(any(unix, windows)))]
+ pub(super) fn host_page() -> Option<u64> {
+     None
+ }
+-- 
+2.47.0.windows.2
+

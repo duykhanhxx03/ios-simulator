@@ -1,0 +1,294 @@
+From 199d51cae9fb636a2728d0b147c9bf1b725443ac Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 22:57:19 +0700
+Subject: [PATCH] Fixes found creating a VM on WSL2 (Ubuntu 26.04)
+
+- setup.sh: Ubuntu 26.04 leaves an empty /lib/modules/<wsl>/build, so
+  build apfs against the WSL kernel tree unless it has a Makefile; find
+  usbip through the linux-tools-* symlinks.
+- linux-create overlay VPhoneProcessRunner: read a child's pipes with
+  blocking reads on their own threads. Foundation's readabilityHandler on
+  Linux missed EOF after losetup, and cfw install waited forever at
+  wasInstalled=false.
+- auto-lock-never.py: retry script.eval while a guest just past its first
+  boot is too slow for vphoned's 30 s script limit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Process/VPhoneProcessRunner.swift         | 216 ++++++++++++++++++
+ setup/setup.sh                                |   4 +-
+ tools/auto-lock-never.py                      |  13 +-
+ 3 files changed, 230 insertions(+), 3 deletions(-)
+ create mode 100644 linux-create/overlay/VPhoneCoreKit/Process/VPhoneProcessRunner.swift
+
+diff --git a/linux-create/overlay/VPhoneCoreKit/Process/VPhoneProcessRunner.swift b/linux-create/overlay/VPhoneCoreKit/Process/VPhoneProcessRunner.swift
+new file mode 100644
+index 0000000..bcde45b
+--- /dev/null
++++ b/linux-create/overlay/VPhoneCoreKit/Process/VPhoneProcessRunner.swift
+@@ -0,0 +1,216 @@
++import Foundation
++
++// MARK: - VPhoneProcessResult
++
++public struct VPhoneProcessResult: Sendable {
++    public let exitCode: Int32
++    public let stdout: String
++    public let stderr: String
++
++    public init(exitCode: Int32, stdout: String, stderr: String) {
++        self.exitCode = exitCode
++        self.stdout = stdout
++        self.stderr = stderr
++    }
++
++    public var succeeded: Bool {
++        exitCode == 0
++    }
++}
++
++// MARK: - VPhoneProcessRunner
++
++public enum VPhoneProcessRunner {
++    /// Thread-safe accumulator for a pipe's bytes. `@unchecked Sendable`
++    /// because access is serialized by its lock, satisfying the readability
++    /// handler's `@Sendable` requirement under Swift 6 strict concurrency.
++    private final class DataBox: @unchecked Sendable {
++        private let lock = NSLock()
++        private var data = Data()
++        func append(_ chunk: Data) {
++            lock.lock()
++            data.append(chunk)
++            lock.unlock()
++        }
++
++        func take() -> Data {
++            lock.lock()
++            defer { lock.unlock() }
++            return data
++        }
++    }
++
++    /// Run `executable args` to completion, capturing stdout/stderr.
++    /// Throws only if the process cannot be launched; a nonzero exit is
++    /// returned in the result, not thrown.
++    ///
++    /// stdout and stderr are drained CONCURRENTLY via readability handlers —
++    /// a sequential "read stdout fully, then stderr" drain deadlocks when a
++    /// child fills one pipe's ~64 KB buffer while still writing the other.
++    public static func runCapturing(
++        _ executable: URL,
++        _ args: [String],
++        cwd: URL? = nil,
++        env: [String: String]? = nil,
++    ) throws -> VPhoneProcessResult {
++        let process = Process()
++        process.executableURL = executable
++        process.arguments = args
++        if let cwd {
++            process.currentDirectoryURL = cwd
++        }
++        if let env {
++            process.environment = env
++        }
++
++        let outPipe = Pipe()
++        let errPipe = Pipe()
++        process.standardOutput = outPipe
++        process.standardError = errPipe
++
++        // Linux: Foundation's readabilityHandler can miss a pipe's EOF when the child exits
++        // quickly (seen with losetup in a CFW install: the write ends all closed, the handler
++        // never called again, group.wait() forever). Blocking reads on their own threads see
++        // EOF from read(2) itself.
++        let outBox = DataBox()
++        let errBox = DataBox()
++        let group = DispatchGroup()
++        let outRead = outPipe.fileHandleForReading
++        let errRead = errPipe.fileHandleForReading
++
++        try process.run()
++        // The parent's copies of the write ends, or the reads never see EOF.
++        try? outPipe.fileHandleForWriting.close()
++        try? errPipe.fileHandleForWriting.close()
++        for (handle, box) in [(outRead, outBox), (errRead, errBox)] {
++            group.enter()
++            let thread = Thread {
++                box.append(handle.readDataToEndOfFile())
++                group.leave()
++            }
++            thread.start()
++        }
++        process.waitUntilExit()
++        group.wait()
++
++        return VPhoneProcessResult(
++            exitCode: process.terminationStatus,
++            stdout: String(decoding: outBox.take(), as: UTF8.self),
++            stderr: String(decoding: errBox.take(), as: UTF8.self),
++        )
++    }
++
++    // `runCountingTarPipe` lived here: a two-stage `/usr/bin/tar` pipe with a
++    // byte counter between the stages, used only by `vm export` and
++    // `vm import`. Both now pack and unpack in-process through
++    // `VPhoneArchiveKit`, which counts its own bytes, so the helper had no
++    // callers left. It is gone rather than kept: a public convenience for
++    // spawning tar is an invitation to shell out again, and the point of the
++    // migration was that a machine with no `zstd(1)` on PATH can still import
++    // a `.tzst`. The `/usr/bin/tar` call sites left in FirmwarePatcher unpack
++    // onto a mounted guest volume with --preserve-permissions; none of them
++    // ever went through here.
++
++    /// Run `executable args`, inheriting the parent's stdout/stderr so output
++    /// streams live to the terminal (for long-running tools: downloads, restore,
++    /// CFW install). Returns the child's exit status; throws only on spawn failure.
++    /// When `echo` is false, the child's stdout/stderr are redirected to the null
++    /// device so nothing reaches the terminal; the exit status is still returned.
++    public static func runStreaming(
++        _ executable: URL,
++        _ args: [String],
++        cwd: URL? = nil,
++        env: [String: String]? = nil,
++        echo: Bool = true,
++    ) throws -> Int32 {
++        let process = Process()
++        process.executableURL = executable
++        process.arguments = args
++        if let cwd {
++            process.currentDirectoryURL = cwd
++        }
++        if let env {
++            process.environment = env
++        }
++
++        if !echo {
++            let devNull = FileHandle.nullDevice
++            process.standardOutput = devNull
++            process.standardError = devNull
++        }
++        // When echo is true: no pipe redirection → child inherits our stdio (live streaming).
++
++        try process.run()
++        process.waitUntilExit()
++        return process.terminationStatus
++    }
++
++    /// Run `executable args` as a controlling-terminal FOREGROUND job.
++    ///
++    /// Foundation spawns children in a new process group, which leaves them in
++    /// the *background* of the terminal — an interactive program they run (e.g.
++    /// `sudo`) then can't disable echo or read the tty (the password shows and
++    /// isn't delivered). This hands the terminal to the child's group via
++    /// `tcsetpgrp` for the duration, so sudo owns the tty and reads the password
++    /// directly; our process never sees it. Our foreground group is restored on
++    /// return. Falls back to a plain inherited run when there is no tty.
++    public static func runForeground(
++        _ executable: URL,
++        _ args: [String],
++        cwd: URL? = nil,
++        env: [String: String]? = nil,
++        echo: Bool = true,
++    ) throws -> Int32 {
++        let process = Process()
++        process.executableURL = executable
++        process.arguments = args
++        if let cwd {
++            process.currentDirectoryURL = cwd
++        }
++        if let env {
++            process.environment = env
++        }
++        // When echo is false, suppress the child's normal output — but it still
++        // becomes the terminal's foreground group below, so an interactive sudo
++        // it runs still prompts/reads via /dev/tty (independent of stdout/stderr).
++        if !echo {
++            let devNull = FileHandle.nullDevice
++            process.standardOutput = devNull
++            process.standardError = devNull
++        }
++
++        var ttyFD = FileHandle.standardInput.fileDescriptor
++        var openedTTY = false
++        if isatty(ttyFD) == 0 {
++            let fd = open("/dev/tty", O_RDWR)
++            guard fd >= 0 else {
++                try process.run()
++                process.waitUntilExit()
++                return process.terminationStatus
++            }
++            ttyFD = fd
++            openedTTY = true
++        }
++
++        let savedFg = tcgetpgrp(ttyFD)
++        // tcsetpgrp from a background group would raise SIGTTOU/SIGTTIN (default:
++        // stop). Ignore them while we juggle the foreground group.
++        let prevTTOU = signal(SIGTTOU, SIG_IGN)
++        let prevTTIN = signal(SIGTTIN, SIG_IGN)
++        defer {
++            signal(SIGTTOU, prevTTOU)
++            signal(SIGTTIN, prevTTIN)
++            if openedTTY {
++                close(ttyFD)
++            }
++        }
++
++        try process.run()
++        _ = tcsetpgrp(ttyFD, process.processIdentifier) // hand the tty to the child
++        process.waitUntilExit()
++        if savedFg > 0 {
++            _ = tcsetpgrp(ttyFD, savedFg)
++        } // take it back
++        return process.terminationStatus
++    }
++}
+diff --git a/setup/setup.sh b/setup/setup.sh
+index 0db63c7..bbc63b7 100755
+--- a/setup/setup.sh
++++ b/setup/setup.sh
+@@ -83,7 +83,7 @@ pkg_feeds() {
+       # Ubuntu's /usr/bin/usbip only runs linux-tools for the running kernel, which is never
+       # installed on WSL or a custom kernel: link the newest one instead.
+       usbip version >/dev/null 2>&1 || {
+-        local u; u=$(find /usr/lib/linux-tools -name usbip 2>/dev/null | sort -V | tail -1 || true)
++        local u; u=$(find -L /usr/lib/linux-tools /usr/lib/linux-tools-* -name usbip -type f 2>/dev/null | sort -V | tail -1 || true)
+         if [ -n "$u" ]; then sudo ln -sf "$u" /usr/local/bin/usbip; fi
+       } ;;
+     arch)
+@@ -240,7 +240,7 @@ build_apfs() {
+     make -C "$dir" clean
+   fi
+   log " Building linux-apfs-rw for kernel $(uname -r)"
+-  if is_wsl && [ ! -e "/lib/modules/$(uname -r)/build" ]; then
++  if is_wsl && [ ! -e "/lib/modules/$(uname -r)/build/Makefile" ]; then
+     # WSL: no headers package for Microsoft's kernel; build against its source tree
+     make -C "$dir" CC="${WSL_KERNEL_CC:-gcc-13}" KERNEL_DIR="$("$VSETUP_SRC/tools/wsl-kernel-tree.sh")"
+   else
+diff --git a/tools/auto-lock-never.py b/tools/auto-lock-never.py
+index e3fb787..0820e61 100755
+--- a/tools/auto-lock-never.py
++++ b/tools/auto-lock-never.py
+@@ -65,7 +65,18 @@ def rpc(method, timeout=120, **params):
+ 
+ 
+ def set_never():
+-    r = rpc("script.eval", source=SCRIPT, timeout=60)
++    # A guest just past its first boot can be too slow for vphoned's 30 s script limit
++    # (seen on WSL under TCG): try again while the guest settles.
++    for attempt in range(8):
++        try:
++            r = rpc("script.eval", source=SCRIPT, timeout=60)
++        except SystemExit as e:
++            if attempt == 7 or "did not finish within" not in str(e.code):
++                raise
++            print(f"{e.code}; retrying in 30 s ({attempt + 1}/8)", flush=True)
++            time.sleep(30)
++            continue
++        break
+     if not r.get("ok"):
+         sys.exit(f"the script failed: {r.get('error')} {r.get('output', '')}")
+     return int(r["output"].strip().splitlines()[-1]) == NEVER
+-- 
+2.53.0
+

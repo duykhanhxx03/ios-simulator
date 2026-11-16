@@ -1,0 +1,38 @@
+From 08c4a26efbb3ea697f67852c29ed4380e29dd06e Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 18:04:50 +0700
+Subject: [PATCH 3/5] qapi: list memory-backend-section among the object types
+
+-object checks qom-type against ObjectType, so the Windows section backend
+was refused at creation although its ,help listed it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ qapi/qom.json | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/qapi/qom.json b/qapi/qom.json
+index c483fda..1ddc93d 100644
+--- a/qapi/qom.json
++++ b/qapi/qom.json
+@@ -1188,6 +1188,8 @@
+     'memory-backend-ram',
+     { 'name': 'memory-backend-shm',
+       'if': 'CONFIG_POSIX' },
++    { 'name': 'memory-backend-section',
++      'if': 'CONFIG_WIN32' },
+     'pef-guest',
+     { 'name': 'pr-manager-helper',
+       'if': 'CONFIG_LINUX' },
+@@ -1262,6 +1264,8 @@
+       'memory-backend-ram':         'MemoryBackendProperties',
+       'memory-backend-shm':         { 'type': 'MemoryBackendShmProperties',
+                                       'if': 'CONFIG_POSIX' },
++      'memory-backend-section':     { 'type': 'MemoryBackendProperties',
++                                      'if': 'CONFIG_WIN32' },
+       'pr-manager-helper':          { 'type': 'PrManagerHelperProperties',
+                                       'if': 'CONFIG_LINUX' },
+       'rng-builtin':                'RngProperties',
+-- 
+2.47.0.windows.2
+

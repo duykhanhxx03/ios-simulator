@@ -1,0 +1,280 @@
+From 23b5ac2a0ffbfafcbbca9d9c08cfcdf26475fe32 Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 22:56:39 +0700
+Subject: [PATCH 8/8] win32: four host-side performance changes (not yet
+ measured one by one)
+
+- os-win32.c: opt the process out of power throttling (EcoQoS, and the timer
+  resolution Windows 11 ignores for a hidden window).
+- get_clock(): one multiply instead of a 128-bit division (10 MHz QPC).
+- qemu_poll_ns(): a high-resolution waitable timer for waits under 50 ms
+  (100 us deadline: 1539 -> 528 us wake-up on this host).
+- tcg/region.c: reserve the JIT buffer next to the image, so helper calls
+  from translated code are direct.
+
+Booted iOS 26.6.2 and ran the Settings scroll benchmark in the -O3/LTO build
+(qemu-pvg-opt): 33-35 fps against 33-39 fps without, within the noise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/qemu/timer.h     | 14 +++++++++
+ os-win32.c               | 28 +++++++++++++++++
+ tcg/region.c             | 51 ++++++++++++++++++++++++++++--
+ util/qemu-timer-common.c |  5 +++
+ util/qemu-timer.c        | 68 +++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 162 insertions(+), 4 deletions(-)
+
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index fd6972b..c221825 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -821,11 +821,25 @@ extern int64_t clock_start;
+    an infinite recursion! */
+ #ifdef _WIN32
+ extern int64_t clock_freq;
++/* NANOSECONDS_PER_SECOND / clock_freq when that is exact, else 0. */
++extern int64_t clock_ns_per_tick;
+ 
+ static inline int64_t get_clock(void)
+ {
+     LARGE_INTEGER ti;
+     QueryPerformanceCounter(&ti);
++    /*
++     * The QPC frequency is 10 MHz on Windows 10 and later, which divides
++     * 1 GHz: scale with one multiply.  muldiv64() is a signed 128-bit
++     * division (a libgcc __divti3 call, tens of cycles) and this is on the
++     * path of every guest CNTVCT/CNTPCT read (gt_get_countervalue() ->
++     * qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)), which XNU's
++     * mach_absolute_time() does all the time.  The product cannot overflow
++     * before the nanosecond value itself would (~292 years of uptime).
++     */
++    if (likely(clock_ns_per_tick)) {
++        return ti.QuadPart * clock_ns_per_tick;
++    }
+     return muldiv64(ti.QuadPart, NANOSECONDS_PER_SECOND, clock_freq);
+ }
+ 
+diff --git a/os-win32.c b/os-win32.c
+index c1bff80..3d07153 100644
+--- a/os-win32.c
++++ b/os-win32.c
+@@ -47,9 +47,37 @@ static void os_undo_timer_resolution(void)
+     timeEndPeriod(mm_tc.wPeriodMin);
+ }
+ 
++/*
++ * Windows 11 power throttling.  Since Windows 11 a process whose windows are
++ * minimised, fully occluded or otherwise invisible (and a process with no
++ * window at all may be treated the same) no longer gets the timer resolution
++ * it asked for with timeBeginPeriod(): its waits fall back to the 15.6 ms
++ * system tick.  Every guest timer interrupt is a QEMUTimer that the main loop
++ * waits for, so a VM that is not in the foreground would see its timers
++ * fire up to ~16 ms late.  Windows may also put such a process under EcoQoS
++ * (lower clocks, efficiency cores).  An emulator wants neither: opt out of
++ * both.  Harmless where unsupported (SetProcessInformation fails before
++ * Windows 10 1709 / 21H2 for the timer bit; the result is ignored).
++ */
++static void os_disable_power_throttling(void)
++{
++    PROCESS_POWER_THROTTLING_STATE state = {
++        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
++        /* Take control of both policies ... */
++        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
++                       PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
++        /* ... and turn both off: HighQoS, timer requests always honoured. */
++        .StateMask = 0,
++    };
++
++    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
++                          &state, sizeof(state));
++}
++
+ void os_setup_early_signal_handling(void)
+ {
+     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
++    os_disable_power_throttling();
+     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
+     timeBeginPeriod(mm_tc.wPeriodMin);
+     atexit(os_undo_timer_resolution);
+diff --git a/tcg/region.c b/tcg/region.c
+index 56bfb78..33bf180 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -595,6 +595,48 @@ static size_t tcg_n_regions(size_t tb_size, unsigned max_threads)
+    ? DEFAULT_CODE_GEN_BUFFER_SIZE_1 : MAX_CODE_GEN_BUFFER_SIZE)
+ 
+ #if defined(_WIN32)
++/*
++ * Put the JIT buffer next to the executable's image when there is room.
++ * The image is ASLR-relocated (DYNAMIC_BASE, HIGH_ENTROPY_VA) and
++ * VirtualAlloc(NULL) usually lands more than 2 GiB away from it, so every
++ * helper call from translated code (softfloat, memory slow paths, ...) is an
++ * indirect "call *pool(%rip)" (tcg_out_branch(), tcg/i386).  Within +-2 GiB of
++ * the image's .text it is a direct "call rel32".  With a buffer larger than
++ * 2 GiB minus the image only its low part gets direct calls; tcg_out_branch()
++ * picks per call, so any placement is correct.  Fall back to anywhere.
++ */
++static void *alloc_code_gen_buffer_near_image(size_t size)
++{
++    const uintptr_t gran = 64 * KiB;    /* allocation granularity */
++    const uint8_t *image = (const uint8_t *)GetModuleHandleW(NULL);
++    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)image;
++    const IMAGE_NT_HEADERS *nt =
++        (const IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
++    uintptr_t start = (uintptr_t)image;
++    uintptr_t end = ROUND_UP(start + nt->OptionalHeader.SizeOfImage, gran);
++    void *buf;
++
++    /* Just above the image, then a few steps further up ... */
++    for (int i = 0; i < 16; i++) {
++        uintptr_t at = end + i * 16 * MiB;
++        buf = VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++        if (buf) {
++            return buf;
++        }
++    }
++    /* ... then just below it. */
++    for (int i = 0; i < 16 && start > size + i * 16 * MiB; i++) {
++        uintptr_t at = ROUND_DOWN(start - size - i * 16 * MiB, gran);
++        buf = VirtualAlloc((void *)at, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++        if (buf) {
++            return buf;
++        }
++    }
++    return NULL;
++}
++
+ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+ {
+     void *buf;
+@@ -604,12 +646,15 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
+         return -1;
+     }
+ 
+-    buf = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+-                             PAGE_EXECUTE_READWRITE);
++    buf = alloc_code_gen_buffer_near_image(size);
++    if (buf == NULL) {
++        buf = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
++                           PAGE_EXECUTE_READWRITE);
++    }
+     if (buf == NULL) {
+         error_setg_win32(errp, GetLastError(),
+                          "allocate %zu bytes for jit buffer", size);
+-        return false;
++        return -1;  /* was "return false" (0, a valid prot set) */
+     }
+ 
+     region.start_aligned = buf;
+diff --git a/util/qemu-timer-common.c b/util/qemu-timer-common.c
+index 28803f2..f03412c 100644
+--- a/util/qemu-timer-common.c
++++ b/util/qemu-timer-common.c
+@@ -32,6 +32,7 @@ int64_t clock_start;
+ #ifdef _WIN32
+ 
+ int64_t clock_freq;
++int64_t clock_ns_per_tick;
+ 
+ static void __attribute__((constructor)) init_get_clock(void)
+ {
+@@ -43,6 +44,10 @@ static void __attribute__((constructor)) init_get_clock(void)
+         exit(1);
+     }
+     clock_freq = freq.QuadPart;
++    if (clock_freq <= NANOSECONDS_PER_SECOND &&
++        NANOSECONDS_PER_SECOND % clock_freq == 0) {
++        clock_ns_per_tick = NANOSECONDS_PER_SECOND / clock_freq;
++    }
+     clock_start = get_clock();
+ }
+ 
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 1fb48be..2ed1d48 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -320,12 +320,78 @@ int qemu_timeout_ns_to_ms(int64_t ns)
+ }
+ 
+ 
++#ifdef _WIN32
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++/* Shorter waits than this get the high-resolution timer below. */
++#define QEMU_POLL_HIRES_MAX_NS (50 * SCALE_MS)
++
++/*
++ * g_poll() takes whole milliseconds (qemu_timeout_ns_to_ms() rounds up), and
++ * a Windows timed wait ends on a timer tick: even at timeBeginPeriod(1) a
++ * 100 us deadline sleeps 1-2 ms.  The main loop serves every guest timer
++ * (the Arm generic timer interrupts are QEMUTimers on QEMU_CLOCK_VIRTUAL),
++ * so short guest timeouts all stretch to 1-2 ms, where ppoll() on Linux
++ * wakes within microseconds.  For short waits add a high-resolution
++ * waitable timer (Windows 10 1803+, no global timer resolution needed) to
++ * the handles polled, armed at the exact deadline.  Its handle is per thread
++ * and lives as long as the thread.
++ */
++static int qemu_poll_ns_win32(GPollFD *fds, guint nfds, int64_t timeout)
++{
++    static __thread HANDLE timer;
++    static __thread bool timer_unavailable;
++    int ms = qemu_timeout_ns_to_ms(timeout);
++    LARGE_INTEGER due;
++    GPollFD *pfds;
++    int ret;
++
++    if (timeout <= 0 || timeout >= QEMU_POLL_HIRES_MAX_NS ||
++        timer_unavailable) {
++        return g_poll(fds, nfds, ms);
++    }
++    if (!timer) {
++        timer = CreateWaitableTimerExW(NULL, NULL,
++                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                       TIMER_ALL_ACCESS);
++        if (!timer) {
++            timer_unavailable = true;   /* older Windows: ms waits */
++            return g_poll(fds, nfds, ms);
++        }
++    }
++    /* Relative due time, in 100 ns units (negative = relative). */
++    due.QuadPart = -(LONGLONG)DIV_ROUND_UP(timeout, 100);
++    /* (Re)arming also clears a signal left from an earlier, unused wait. */
++    if (!SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) {
++        return g_poll(fds, nfds, ms);
++    }
++
++    pfds = g_newa(GPollFD, nfds + 1);
++    memcpy(pfds, fds, nfds * sizeof(*pfds));
++    pfds[nfds] = (GPollFD) { .fd = (gintptr)timer, .events = G_IO_IN };
++
++    /* The ms timeout stays as a backstop; the timer fires first. */
++    ret = g_poll(pfds, nfds + 1, ms);
++
++    for (guint i = 0; i < nfds; i++) {
++        fds[i].revents = pfds[i].revents;
++    }
++    if (ret > 0 && pfds[nfds].revents) {
++        ret--;      /* the timer is not one of the caller's fds */
++    }
++    return ret;
++}
++#endif
++
+ /* qemu implementation of g_poll which uses a nanosecond timeout but is
+  * otherwise identical to g_poll
+  */
+ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+ {
+-#ifdef CONFIG_PPOLL
++#ifdef _WIN32
++    return qemu_poll_ns_win32(fds, nfds, timeout);
++#elif defined(CONFIG_PPOLL)
+     if (timeout < 0) {
+         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
+     } else {
+-- 
+2.47.0.windows.2
+

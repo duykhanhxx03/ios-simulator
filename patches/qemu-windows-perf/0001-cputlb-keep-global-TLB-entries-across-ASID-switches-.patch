@@ -1,0 +1,885 @@
+From eeb3ee655d89febd10262fec754101e5ad5f27df Mon Sep 17 00:00:00 2001
+From: YahiaAngelo <yahia.mostafa.elsayed@gmail.com>
+Date: Wed, 11 Nov 2026 15:40:04 +0200
+Subject: [PATCH 1/8] cputlb: keep global TLB entries across ASID switches
+ (VPHONE_ASID_NG); event-rate counters
+
+An ASID switch (TTBR0/1_EL1 write) flushed every MMU index. Architecturally it
+only invalidates non-global (nG) translations, and QEMU's TLB holds only the
+current ASID's, so now:
+
+- ptw records nG in CPUTLBEntryFull.vphone_ng (two-range regimes);
+- each MMU index logs the slots filled with nG entries (up to 2048; beyond
+  that the next switch flushes the index);
+- tlb_flush_asid_switch() drops only those (and nG victims) in the EL1&0
+  indexes (E10_0, E10_1, E10_1_PAN, GE10_1, GE10_1_PAN), leaves the physical
+  and stage-2 indexes alone, and flushes the rest;
+- a range flush too long to do page by page, wholly below bit 63, in an index
+  with no global entries there, drops the logged entries that overlap it
+  (whole blocks, by lg_page_size) instead of the whole index.
+
+VPHONE_ASID_NG=0 restores the old full flush.
+
+iPhone Duo (iOS 27.1), per second: TLB fills during boot 4.3M -> 2.2-2.4M,
+app launches 3.7M -> 1.9-2.1M (kernel upper-half refills -65..85%, physical
+index refills -80%); range flushes escalated to whole-index flushes 6.9k ->
+0.9k at boot. MMU walk + fill share of vCPU time 11-17% -> ~9%. guestbench,
+3 boots x 5 runs per arm: median 5.17 s vs 5.45 s (within boot-to-boot noise).
+
+Diagnostics (off by default): VPHONE_EVENT_STATS=<seconds> logs per-second
+rates of exceptions by kind, GENTER/GEXIT/ERET, TLB fills (per MMU index and
+address half), flushes by kind and escalation, SPRR/GXF flush sources, ASID
+reuse, translations (and their cycles), MMIO and code-page writes
+(include/qemu/vphone-ev.h, util/vphone-ev.c).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N89PWg24VJrcxX3MuUo4uM
+---
+ accel/tcg/cputlb.c             | 193 ++++++++++++++++++++++++++++++++-
+ accel/tcg/translate-all.c      |  16 +++
+ hw/arm/apple-silicon/a13_gxf.c |   9 +-
+ include/exec/cputlb.h          |  14 ++-
+ include/hw/core/cpu.h          |  18 +++
+ include/qemu/vphone-ev.h       |  47 ++++++++
+ target/arm/helper.c            |  73 ++++++++++++-
+ target/arm/ptw.c               |   7 ++
+ target/arm/tcg/helper-a64.c    |   4 +
+ util/meson.build               |   2 +-
+ util/vphone-ev.c               | 104 ++++++++++++++++++
+ 11 files changed, 474 insertions(+), 13 deletions(-)
+ create mode 100644 include/qemu/vphone-ev.h
+ create mode 100644 util/vphone-ev.c
+
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index 8e35950..97620f8 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-ev.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/target-info.h"
+ #include "accel/tcg/cpu-ops.h"
+@@ -285,8 +286,13 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
+     }
+ }
+ 
++#define VPHONE_NG_LOG_MAX 2048
++
+ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
+ {
++    desc->ng_n = 0;
++    desc->ng_overflow = false;
++    desc->lo_global = false;
+     desc->n_used_entries = 0;
+     desc->large_page_addr = -1;
+     desc->large_page_mask = -1;
+@@ -314,6 +320,7 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
+     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
+     fast->table = g_new(CPUTLBEntry, n_entries);
+     desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
++    desc->ng_log = g_new(uint32_t, VPHONE_NG_LOG_MAX);
+     tlb_mmu_flush_locked(desc, fast);
+ }
+ 
+@@ -431,18 +438,87 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
+ }
+ 
+ /*
+- * vphone-linux: tlb_flush() for a change of address space alone, to ASID
+- * @asid (tb-jmp-cache.h): the TLBs are flushed, as they hold no ASID, but
+- * the jump cache keeps what it filled under @asid.
++ * vphone-linux: drop the non-global (vphone_ng) entries of @mmu_idx, the ones
++ * its ng_log names, and those of its victim TLB. Global entries stay: a change
++ * of ASID does not change them. With too many to name, flush the whole index.
+  */
+-void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
++static inline bool tlb_entry_is_empty(const CPUTLBEntry *te);
++
++static void tlb_flush_ng_one_mmuidx_locked(CPUState *cpu, int mmu_idx, int64_t now)
++{
++    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
++    CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
++    size_t n_entries = tlb_n_entries(fast);
++
++    if (desc->ng_overflow) {
++        tlb_flush_one_mmuidx_locked(cpu, mmu_idx, now);
++        return;
++    }
++    for (uint32_t i = 0; i < desc->ng_n; i++) {
++        uint32_t index = desc->ng_log[i];
++
++        if (index < n_entries && desc->fulltlb[index].vphone_ng &&
++            !tlb_entry_is_empty(&fast->table[index])) {
++            memset(&fast->table[index], -1, sizeof(fast->table[index]));
++            tlb_n_used_entries_dec(cpu, mmu_idx);
++        }
++    }
++    desc->ng_n = 0;
++    for (int v = 0; v < CPU_VTLB_SIZE; v++) {
++        if (desc->vfulltlb[v].vphone_ng) {
++            memset(&desc->vtable[v], -1, sizeof(desc->vtable[v]));
++        }
++    }
++}
++
++static int vphone_asid_ng_on(void)
+ {
++    static int on = -1;
++
++    if (unlikely(on < 0)) {
++        const char *e = getenv("VPHONE_ASID_NG");
++        on = !(e && *e && atoi(e) == 0);
++    }
++    return on;
++}
++
++/*
++ * vphone-linux: a change of address space alone, to ASID @asid
++ * (tb-jmp-cache.h). The TLBs hold no ASID, so the entries of the old address
++ * space go: in @ng_map (the ASID-tagged MMU indexes) only the non-global ones,
++ * as on hardware; @keep_map (MMU indexes no ASID applies to, such as physical
++ * ones) is left alone; every other index is flushed. The jump cache keeps what
++ * it filled under @asid. VPHONE_ASID_NG=0 flushes every index, as before.
++ */
++void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
++                           MMUIdxMap keep_map)
++{
++    MMUIdxMap dirty, full_map;
++    int64_t now;
++
++    vphone_ev(VEV_FLUSH_ASID);
+     assert_cpu_is_self(cpu);
+-    tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
++    if (!vphone_asid_ng_on()) {
++        tlb_flush_mmuidx_work(cpu, ALL_MMUIDX_BITS, asid);
++        return;
++    }
++    full_map = ALL_MMUIDX_BITS & ~ng_map & ~keep_map;
++    tlb_flush_mmuidx_work(cpu, full_map, asid);
++
++    now = get_clock_realtime();
++    qemu_spin_lock(&cpu->neg.tlb.c.lock);
++    dirty = cpu->neg.tlb.c.dirty & ng_map;
++    for (MMUIdxMap work = dirty; work != 0; work &= work - 1) {
++        tlb_flush_ng_one_mmuidx_locked(cpu, ctz32(work), now);
++    }
++    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+ }
+ 
+ void tlb_flush_by_mmuidx(CPUState *cpu, MMUIdxMap idxmap)
+ {
++    vphone_ev(VEV_FLUSH_MMUIDX);
++    vphone_ev(idxmap == ALL_MMUIDX_BITS ? VEV_FLUSHIDX_ALL :
++              is_power_of_2(idxmap) ? VEV_FLUSHIDX_ONE : VEV_FLUSHIDX_OTHER);
+     tlb_debug("mmu_idx: 0x%" PRIx32 "\n", idxmap);
+ 
+     assert_cpu_is_self(cpu);
+@@ -662,6 +738,7 @@ static void tlb_flush_on_src(CPUState *src_cpu, run_on_cpu_func fn,
+ 
+ void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
+ {
++    vphone_ev(VEV_FLUSH_MMUIDX_ALL);
+     const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
+ 
+     tlb_debug("mmu_idx: 0x%"PRIx32"\n", idxmap);
+@@ -750,6 +827,7 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
+         tlb_debug("forcing full flush midx %d (%016"
+                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
+                   midx, lp_addr, lp_mask);
++        vphone_ev(VEV_PAGE_FULL_LARGE);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+     } else {
+         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+@@ -840,6 +918,7 @@ static void tlb_flush_page_by_mmuidx_async_2(CPUState *cpu,
+ 
+ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, MMUIdxMap idxmap)
+ {
++    vphone_ev(VEV_FLUSH_PAGE);
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%" PRIx32 "\n", addr, idxmap);
+ 
+     assert_cpu_is_self(cpu);
+@@ -859,6 +938,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+                                               vaddr addr,
+                                               MMUIdxMap idxmap)
+ {
++    vphone_ev(VEV_FLUSH_PAGE_ALL);
+     tlb_debug("addr: %016" VADDR_PRIx " mmu_idx:%"PRIx32"\n", addr, idxmap);
+ 
+     /* This should already be page aligned */
+@@ -902,6 +982,76 @@ void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
+     tlb_flush_page_by_mmuidx_all_cpus_synced(src, addr, ALL_MMUIDX_BITS);
+ }
+ 
++/* vphone-linux: the page of a valid TLB entry, or -1 */
++static vaddr vphone_entry_page(const CPUTLBEntry *te)
++{
++    uint64_t a = te->addr_read != -1 ? te->addr_read :
++                 te->addr_write != -1 ? te->addr_write : te->addr_code;
++
++    return a == -1 ? (vaddr)-1 : (vaddr)(a & TARGET_PAGE_MASK);
++}
++
++/* vphone-linux: does the mapping (@page, 1 << @lg bytes) overlap [@addr, @addr + @len)? */
++static bool vphone_overlaps(vaddr page, unsigned lg, vaddr addr, vaddr len, vaddr mask)
++{
++    vaddr size = lg > TARGET_PAGE_BITS ? (vaddr)1 << lg : TARGET_PAGE_SIZE;
++    vaddr base = (page & mask) & ~(size - 1);
++    vaddr a = addr & mask;
++
++    return base < a + len && a < base + size;
++}
++
++/*
++ * vphone-linux: a range too long to flush page by page, wholly below bit 63,
++ * in an MMU index whose entries there are all non-global: drop the logged
++ * entries (and victims) that overlap it instead of the whole index. Returns
++ * false when that does not apply.
++ */
++static bool tlb_flush_range_by_log_locked(CPUState *cpu, int midx, vaddr addr,
++                                          vaddr len, vaddr mask)
++{
++    CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
++    CPUTLBDescFast *f = cpu_tlb_fast(cpu, midx);
++    size_t n_entries = tlb_n_entries(f);
++    uint32_t keep = 0;
++
++    if (!vphone_asid_ng_on() || d->ng_overflow || d->lo_global ||
++        ((addr + len - 1) >> 63) || addr + len < addr) {
++        return false;
++    }
++    vphone_ev(VEV_RANGE_BY_LOG);
++    for (uint32_t i = 0; i < d->ng_n; i++) {
++        uint32_t index = d->ng_log[i];
++        CPUTLBEntry *te;
++        vaddr page;
++
++        if (index >= n_entries || !d->fulltlb[index].vphone_ng) {
++            continue;
++        }
++        te = &f->table[index];
++        page = vphone_entry_page(te);
++        if (page == (vaddr)-1) {
++            continue;
++        }
++        if (vphone_overlaps(page, d->fulltlb[index].lg_page_size, addr, len, mask)) {
++            memset(te, -1, sizeof(*te));
++            tlb_n_used_entries_dec(cpu, midx);
++        } else {
++            d->ng_log[keep++] = index;
++        }
++    }
++    d->ng_n = keep;
++    for (int v = 0; v < CPU_VTLB_SIZE; v++) {
++        vaddr page = vphone_entry_page(&d->vtable[v]);
++
++        if (page != (vaddr)-1 &&
++            vphone_overlaps(page, d->vfulltlb[v].lg_page_size, addr, len, mask)) {
++            memset(&d->vtable[v], -1, sizeof(d->vtable[v]));
++        }
++    }
++    return true;
++}
++
+ static void tlb_flush_range_locked(CPUState *cpu, int midx,
+                                    vaddr addr, vaddr len,
+                                    unsigned bits)
+@@ -941,6 +1091,11 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
+         tlb_debug("forcing full flush midx %d ("
+                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
+                   midx, addr, mask, len);
++        if (mask >= f->mask &&
++            tlb_flush_range_by_log_locked(cpu, midx, addr, len, mask)) {
++            return;
++        }
++        vphone_ev(VEV_RANGE_FULL_SIZE);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+         return;
+     }
+@@ -954,6 +1109,7 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
+         tlb_debug("forcing full flush midx %d ("
+                   "%016" VADDR_PRIx "/%016" VADDR_PRIx ")\n",
+                   midx, d->large_page_addr, d->large_page_mask);
++        vphone_ev(VEV_RANGE_FULL_LARGE);
+         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
+         return;
+     }
+@@ -1037,6 +1193,7 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
+                                vaddr len, MMUIdxMap idxmap,
+                                unsigned bits)
+ {
++    vphone_ev(VEV_FLUSH_RANGE);
+     TLBFlushRangeData d;
+ 
+     assert_cpu_is_self(cpu);
+@@ -1076,6 +1233,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
+                                                MMUIdxMap idxmap,
+                                                unsigned bits)
+ {
++    vphone_ev(VEV_FLUSH_RANGE_ALL);
+     TLBFlushRangeData d, *p;
+     CPUState *dst_cpu;
+ 
+@@ -1423,6 +1581,15 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+      */
+     desc->fulltlb[index] = *full;
+     full = &desc->fulltlb[index];
++    if (full->vphone_ng) {
++        if (desc->ng_n < VPHONE_NG_LOG_MAX) {
++            desc->ng_log[desc->ng_n++] = index;
++        } else {
++            desc->ng_overflow = true;
++        }
++    } else if (!(addr >> 63)) {
++        desc->lo_global = true;
++    }
+     full->xlat_offset = iotlb - addr_page;
+     full->section = section;
+     full->phys_addr = paddr_page;
+@@ -1509,6 +1676,8 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
+                            int mmu_idx, MemOp memop, int size,
+                            bool probe, uintptr_t ra)
+ {
++    vphone_ev(VEV_TLB_FILL);
++    vphone_ev(VEV_FILLX + (mmu_idx & 31) * 2 + (int)(addr >> 63));
+     const TCGCPUOps *ops = cpu->cc->tcg_ops;
+     CPUTLBEntryFull full;
+ 
+@@ -1543,6 +1712,7 @@ static MemoryRegionSection *
+ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
+            vaddr addr, uintptr_t retaddr)
+ {
++    vphone_ev(VEV_MMIO);
+     MemoryRegionSection *section;
+     hwaddr mr_offset;
+ 
+@@ -1597,6 +1767,18 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+             CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
+             CPUTLBEntryFull tmpf;
+             tmpf = *f1; *f1 = *f2; *f2 = tmpf;
++            /* vphone-linux: a non-global entry now in @index must be named. */
++            if (f1->vphone_ng) {
++                CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
++
++                qemu_spin_lock(&cpu->neg.tlb.c.lock);
++                if (desc->ng_n < VPHONE_NG_LOG_MAX) {
++                    desc->ng_log[desc->ng_n++] = index;
++                } else {
++                    desc->ng_overflow = true;
++                }
++                qemu_spin_unlock(&cpu->neg.tlb.c.lock);
++            }
+             return true;
+         }
+     }
+@@ -1606,6 +1788,7 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
+                            CPUTLBEntryFull *full, uintptr_t retaddr)
+ {
++    vphone_ev(VEV_NOTDIRTY);
+     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
+ 
+     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 3b72dcf..1fcbeb3 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-ev.h"
+ 
+ #include "trace.h"
+ #include "tcg/tcg.h"
+@@ -255,7 +256,22 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
+     return tcg_gen_code(tcg_ctx, tb, pc);
+ }
+ 
++static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s);
++
+ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
++{
++    if (unlikely(vphone_ev_on)) {
++        uint64_t t0 = __builtin_ia32_rdtsc();
++        TranslationBlock *tb = tb_gen_code_inner(cpu, s);
++
++        vphone_ev(VEV_TB_GEN);
++        vphone_ev_add(VEV_TB_GEN_KCYC, (__builtin_ia32_rdtsc() - t0) / 1000);
++        return tb;
++    }
++    return tb_gen_code_inner(cpu, s);
++}
++
++static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
+ {
+     CPUArchState *env = cpu_env(cpu);
+     TranslationBlock *tb, *existing_tb;
+diff --git a/hw/arm/apple-silicon/a13_gxf.c b/hw/arm/apple-silicon/a13_gxf.c
+index bbe7db0..00f7594 100644
+--- a/hw/arm/apple-silicon/a13_gxf.c
++++ b/hw/arm/apple-silicon/a13_gxf.c
+@@ -25,6 +25,7 @@
+ #include "target/arm/cpregs.h"
+ #include "target/arm/cpu.h"
+ #include "target/arm/internals.h"
++#include "qemu/vphone-ev.h"
+ 
+ static CPAccessResult access_gxf(CPUARMState *env, const ARMCPRegInfo *ri,
+                                  bool isread)
+@@ -170,6 +171,7 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+          */
+         if (raw_read(env, ri) != value) {
+             raw_write(env, ri, value);
++            vphone_ev(VEV_SPRR_EL0_FLUSH);
+             tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+         }
+         return;
+@@ -206,7 +208,8 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+         env->sprr.sprr_el_br_el1[0][1] = perm;
+     }
+ 
+-    tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
++    vphone_ev(VEV_SPRR_EL0_FLUSH);
++            tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+ }
+ 
+ /* S3_6_C15_C1_6: EL0/BR1 table, or the EL1 table in the unified layout */
+@@ -242,7 +245,8 @@ static void sprr_c1_6_write(CPUARMState *env, const ARMCPRegInfo *ri,
+         }
+         env->sprr.sprr_el_br_el1[0][1] = value;
+     }
+-    tlb_flush(env_cpu(env));
++    vphone_ev(VEV_SPRR_EL1_FLUSH);
++        tlb_flush(env_cpu(env));
+ }
+ 
+ static void sprr_c1_6_reset(CPUARMState *env, const ARMCPRegInfo *ri)
+@@ -276,6 +280,7 @@ static void sprr_c3_0_write(CPUARMState *env, const ARMCPRegInfo *ri,
+         env->sprr.c3_0 = value;
+     } else if (env->sprr.sprr_el_br_el1[1][1] != value) {
+         env->sprr.sprr_el_br_el1[1][1] = value;
++        vphone_ev(VEV_SPRR_EL1_FLUSH);
+         tlb_flush(env_cpu(env));
+     }
+ }
+diff --git a/include/exec/cputlb.h b/include/exec/cputlb.h
+index 67f16dd..b6dc188 100644
+--- a/include/exec/cputlb.h
++++ b/include/exec/cputlb.h
+@@ -132,10 +132,15 @@ void tlb_flush(CPUState *cpu);
+  * @cpu: CPU whose TLB should be flushed (the current one)
+  * @asid: the address space it switches to
+  *
+- * tlb_flush() for a change of address space alone (vphone-linux): the
+- * jump cache keeps the entries it filled under @asid in this epoch.
++ * @ng_map: ASID-tagged MMU indexes: only their non-global entries go
++ * @keep_map: MMU indexes no ASID applies to: left alone
++ *
++ * tlb_flush() for a change of address space alone (vphone-linux): every
++ * other MMU index is flushed, and the jump cache keeps the entries it filled
++ * under @asid in this epoch. VPHONE_ASID_NG=0 flushes every index.
+  */
+-void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid);
++void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid, MMUIdxMap ng_map,
++                           MMUIdxMap keep_map);
+ 
+ /**
+  * tlb_flush_all_cpus_synced:
+@@ -247,7 +252,8 @@ static inline void tlb_flush_page_all_cpus_synced(CPUState *src, vaddr addr)
+ static inline void tlb_flush(CPUState *cpu)
+ {
+ }
+-static inline void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid)
++static inline void tlb_flush_asid_switch(CPUState *cpu, uint32_t asid,
++                                         MMUIdxMap ng_map, MMUIdxMap keep_map)
+ {
+ }
+ static inline void tlb_flush_all_cpus_synced(CPUState *src_cpu)
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 2eb9d72..d51dbaf 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -238,6 +238,13 @@ struct CPUTLBEntryFull {
+     /* Additional tlb flags requested by tlb_fill. */
+     uint8_t tlb_fill_flags;
+ 
++    /*
++     * vphone-linux: the mapping is not global (an Arm nG descriptor): it
++     * belongs to the current ASID only. tlb_flush_asid_switch() drops just
++     * these entries of the ASID-tagged MMU indexes.
++     */
++    uint8_t vphone_ng;
++
+     /*
+      * Additional tlb flags for use by the slow path. If non-zero,
+      * the corresponding CPUTLBEntry comparator must have TLB_FORCE_SLOW.
+@@ -290,6 +297,17 @@ typedef struct CPUTLBDesc {
+     CPUTLBEntry vtable[CPU_VTLB_SIZE];
+     CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
+     CPUTLBEntryFull *fulltlb;
++    /*
++     * vphone-linux: indexes of fulltlb entries filled with vphone_ng since the
++     * last flush of this MMU index, so that an ASID switch can drop them
++     * without scanning the table. ng_overflow: more than fit; the next ASID
++     * switch flushes the whole index.
++     */
++    uint32_t *ng_log;
++    uint32_t ng_n;
++    bool ng_overflow;
++    /* vphone-linux: a global entry below bit 63 was filled since the last flush */
++    bool lo_global;
+ } CPUTLBDesc;
+ 
+ /*
+diff --git a/include/qemu/vphone-ev.h b/include/qemu/vphone-ev.h
+new file mode 100644
+index 0000000..7dd31bd
+--- /dev/null
++++ b/include/qemu/vphone-ev.h
+@@ -0,0 +1,47 @@
++/*
++ * vphone diagnostic (VPHONE_EVENT_STATS=<seconds>): per-second rates of guest events that
++ * leave translated code (exceptions by kind, GXF enter/exit, ERET), TLB fills and flushes,
++ * translations, MMIO and code-page writes. Each thread counts into its own array; a logger
++ * thread prints the sums to stderr every <seconds>. Off by default: one predictable branch.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_VPHONE_EV_H
++#define QEMU_VPHONE_EV_H
++
++enum {
++    VEV_SVC_EL0, VEV_SVC_OTHER, VEV_IRQ, VEV_FIQ, VEV_DABT_EL0, VEV_DABT_EL1,
++    VEV_IABT, VEV_UDEF, VEV_GENTER, VEV_GXF_ABORT, VEV_EXC_OTHER,
++    VEV_ERET, VEV_GEXIT,
++    VEV_TLB_FILL, VEV_FLUSH_MMUIDX, VEV_FLUSH_MMUIDX_ALL, VEV_FLUSH_ASID,
++    VEV_FLUSH_PAGE, VEV_FLUSH_PAGE_ALL, VEV_FLUSH_RANGE, VEV_FLUSH_RANGE_ALL,
++    VEV_TB_GEN, VEV_TB_GEN_KCYC, VEV_NOTDIRTY, VEV_MMIO,
++    VEV_RANGE_FULL_SIZE, VEV_RANGE_FULL_LARGE, VEV_PAGE_FULL_LARGE,
++    VEV_FLUSHIDX_ALL, VEV_FLUSHIDX_ONE, VEV_FLUSHIDX_OTHER, VEV_RANGE_BY_LOG,
++    VEV_ASID_RECENT8, VEV_ASID_KEY_RECENT8, VEV_SPRR_EL0_FLUSH, VEV_SPRR_EL1_FLUSH,
++    VEV_GXF_ERET_FLUSH,
++    /* TLB fills per (core mmu_idx & 31) * 2 + (address bit 63) */
++    VEV_FILLX, VEV_FILLX_END = VEV_FILLX + 64,
++    VEV_MAX = VEV_FILLX_END
++};
++
++extern int vphone_ev_on;
++extern __thread unsigned long long *vphone_ev_tls;
++void vphone_ev_register(void);
++
++static inline void vphone_ev_add(int k, unsigned long long n)
++{
++    if (__builtin_expect(vphone_ev_on, 0)) {
++        if (__builtin_expect(!vphone_ev_tls, 0)) {
++            vphone_ev_register();
++        }
++        vphone_ev_tls[k] += n;
++    }
++}
++
++static inline void vphone_ev(int k)
++{
++    vphone_ev_add(k, 1);
++}
++
++#endif
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index d8bd12d..e46542f 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -27,6 +27,7 @@
+ #include "system/tcg.h"
+ #include "qapi/error.h"
+ #include "qemu/guest-random.h"
++#include "qemu/vphone-ev.h"
+ #ifdef CONFIG_TCG
+ #include "accel/tcg/probe.h"
+ #include "accel/tcg/getpc.h"
+@@ -2939,7 +2940,39 @@ static void vmsa_ttbr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+             ri->crm == 0 && ri->opc2 <= 1) {
+             uint64_t ttbr = (env->cp15.tcr_el[1] & TTBCR_A1)
+                             ? env->cp15.ttbr1_el[1] : env->cp15.ttbr0_el[1];
+-            tlb_flush_asid_switch(CPU(cpu), extract64(ttbr, 48, 16));
++            if (unlikely(vphone_ev_on)) {
++                /* diagnostic: is the new ASID (and ASID + EL0 SPRR) one of the last 8? */
++                static __thread uint64_t ring[8], kring[8];
++                static __thread unsigned ri;
++                static __thread unsigned kri;
++                uint64_t a = extract64(ttbr, 48, 16) + 1;
++                uint64_t k = a ^ (env->sprr.sprr_el_br_el1[0][0] * 0x9e3779b97f4a7c15ull);
++                bool hit = false, khit = false;
++
++                for (int i = 0; i < 8; i++) {
++                    hit |= ring[i] == a;
++                    khit |= kring[i] == k;
++                }
++                if (hit) {
++                    vphone_ev(VEV_ASID_RECENT8);
++                } else {
++                    ring[ri++ % 8] = a;
++                }
++                if (khit) {
++                    vphone_ev(VEV_ASID_KEY_RECENT8);
++                } else {
++                    kring[kri++ % 8] = k;
++                }
++            }
++            tlb_flush_asid_switch(CPU(cpu), extract64(ttbr, 48, 16),
++                                  ARMMMUIdxBit_E10_0 | ARMMMUIdxBit_E10_1 |
++                                  ARMMMUIdxBit_E10_1_PAN | ARMMMUIdxBit_GE10_1 |
++                                  ARMMMUIdxBit_GE10_1_PAN,
++                                  ARMMMUIdxBit_Stage2 | ARMMMUIdxBit_Stage2_S |
++                                  (1 << (ARMMMUIdx_Phys_S & ARM_MMU_IDX_COREIDX_MASK)) |
++                                  (1 << (ARMMMUIdx_Phys_NS & ARM_MMU_IDX_COREIDX_MASK)) |
++                                  (1 << (ARMMMUIdx_Phys_Root & ARM_MMU_IDX_COREIDX_MASK)) |
++                                  (1 << (ARMMMUIdx_Phys_Realm & ARM_MMU_IDX_COREIDX_MASK)));
+         } else {
+             tlb_flush(CPU(cpu));
+         }
+@@ -8889,6 +8922,44 @@ static void arm_cpu_do_interrupt_aarch64(CPUState *cs)
+         addr = env->gxf.vbar_gl[new_el];
+     }
+ 
++    if (unlikely(vphone_ev_on)) {
++        switch (cs->exception_index) {
++        case EXCP_SWI:
++            vphone_ev(cur_el == 0 ? VEV_SVC_EL0 : VEV_SVC_OTHER);
++            break;
++        case EXCP_HVC:
++        case EXCP_SMC:
++            vphone_ev(VEV_SVC_OTHER);
++            break;
++        case EXCP_IRQ:
++        case EXCP_VIRQ:
++            vphone_ev(VEV_IRQ);
++            break;
++        case EXCP_FIQ:
++        case EXCP_VFIQ:
++            vphone_ev(VEV_FIQ);
++            break;
++        case EXCP_DATA_ABORT:
++            vphone_ev(cur_el == 0 ? VEV_DABT_EL0 : VEV_DABT_EL1);
++            break;
++        case EXCP_PREFETCH_ABORT:
++            vphone_ev(VEV_IABT);
++            break;
++        case EXCP_UDEF:
++            vphone_ev(VEV_UDEF);
++            break;
++        case EXCP_GENTER:
++            vphone_ev(VEV_GENTER);
++            break;
++        case EXCP_GXF_ABORT:
++            vphone_ev(VEV_GXF_ABORT);
++            break;
++        default:
++            vphone_ev(VEV_EXC_OTHER);
++            break;
++        }
++    }
++
+     if (tcg_enabled()) {
+         /*
+          * Note that new_el can never be 0.  If cur_el is 0, then
+diff --git a/target/arm/ptw.c b/target/arm/ptw.c
+index c4329fc..17ffccf 100644
+--- a/target/arm/ptw.c
++++ b/target/arm/ptw.c
+@@ -2309,6 +2309,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
+         if (aarch64 && cpu_isar_feature(aa64_bti, cpu)) {
+             result->f.extra.arm.guarded = extract64(attrs, 50, 1); /* GP */
+         }
++        /* vphone-linux: nG, for tlb_flush_asid_switch() (two-range regimes only). */
++        if (aarch64 && regime_has_2_ranges(mmu_idx)) {
++            result->f.vphone_ng = extract64(attrs, 11, 1);
++        }
+         device = S1_attrs_are_device(result->cacheattrs.attrs);
+     }
+ 
+@@ -3519,6 +3523,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
+     int s1_prot, s1_lgpgsz;
+     ARMSecuritySpace in_space = ptw->in_space;
+     bool ret, ipa_secure, s1_guarded;
++    uint8_t s1_ng;
+     ARMCacheAttrs cacheattrs1;
+     ARMSecuritySpace ipa_space;
+     uint64_t hcr;
+@@ -3547,6 +3552,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
+     s1_prot = result->f.prot;
+     s1_lgpgsz = result->f.lg_page_size;
+     s1_guarded = result->f.extra.arm.guarded;
++    s1_ng = result->f.vphone_ng;
+     cacheattrs1 = result->cacheattrs;
+     memset(result, 0, sizeof(*result));
+ 
+@@ -3600,6 +3606,7 @@ static bool get_phys_addr_twostage(CPUARMState *env, S1Translate *ptw,
+ 
+     /* No BTI GP information in stage 2, we just use the S1 value */
+     result->f.extra.arm.guarded = s1_guarded;
++    result->f.vphone_ng = s1_ng;
+ 
+     /*
+      * Check if IPA translates to secure or non-secure PA space.
+diff --git a/target/arm/tcg/helper-a64.c b/target/arm/tcg/helper-a64.c
+index 6ff4917..60acec2 100644
+--- a/target/arm/tcg/helper-a64.c
++++ b/target/arm/tcg/helper-a64.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-ev.h"
+ #include "qemu/units.h"
+ #include "cpu.h"
+ #include "gdbstub/helpers.h"
+@@ -634,6 +635,7 @@ static void cpsr_write_from_spsr_elx(CPUARMState *env,
+ 
+ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
+ {
++    vphone_ev(VEV_ERET);
+     ARMCPU *cpu = env_archcpu(env);
+     int cur_el = arm_current_el(env);
+     unsigned int spsr_idx = aarch64_banked_spsr_index(cur_el);
+@@ -744,6 +746,7 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
+             (env->gxf.gxf_status_el[0] & 1) != from_guarded) {
+             env->gxf.gxf_status_el[0] =
+                 (env->gxf.gxf_status_el[0] & ~1ULL) | from_guarded;
++            vphone_ev(VEV_GXF_ERET_FLUSH);
+             tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+         }
+         aarch64_restore_sp(env, new_el);
+@@ -808,6 +811,7 @@ illegal_return:
+ 
+ void HELPER(gexit)(CPUARMState *env)
+ {
++    vphone_ev(VEV_GEXIT);
+     int cur_el = arm_current_el(env);
+     uint32_t spsr = env->gxf.spsr_gl[cur_el];
+     bool return_to_gl = (env->gxf.aspsr_gl[cur_el] & 1) != 0;
+diff --git a/util/meson.build b/util/meson.build
+index d9a4695..3b9e022 100644
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -1,4 +1,4 @@
+-util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c'))
++util_ss.add(files('osdep.c', 'cutils.c', 'unicode.c', 'qemu-timer-common.c', 'vphone-ev.c'))
+ util_ss.add(files('thread-context.c'), numa)
+ if not config_host_data.get('CONFIG_ATOMIC64')
+   util_ss.add(files('atomic64.c'))
+diff --git a/util/vphone-ev.c b/util/vphone-ev.c
+new file mode 100644
+index 0000000..eac4251
+--- /dev/null
++++ b/util/vphone-ev.c
+@@ -0,0 +1,104 @@
++/*
++ * vphone diagnostic event rates (VPHONE_EVENT_STATS=<seconds>); see include/qemu/vphone-ev.h.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/vphone-ev.h"
++#include "qemu/thread.h"
++
++int vphone_ev_on;
++__thread unsigned long long *vphone_ev_tls;
++
++#define VEV_THREADS 256
++static unsigned long long *vev_arrays[VEV_THREADS];
++static int vev_nthreads;
++static QemuMutex vev_lock;
++static int vev_period;
++
++static const char *const vev_names[VEV_MAX] = {
++    [VEV_SVC_EL0] = "svc_el0", [VEV_SVC_OTHER] = "svc_hvc_smc_other",
++    [VEV_IRQ] = "irq", [VEV_FIQ] = "fiq",
++    [VEV_DABT_EL0] = "dabt_el0", [VEV_DABT_EL1] = "dabt_el1",
++    [VEV_IABT] = "iabt", [VEV_UDEF] = "udef_trap", [VEV_GENTER] = "genter",
++    [VEV_GXF_ABORT] = "gxf_abort", [VEV_EXC_OTHER] = "exc_other",
++    [VEV_ERET] = "eret", [VEV_GEXIT] = "gexit",
++    [VEV_TLB_FILL] = "tlb_fill",
++    [VEV_FLUSH_MMUIDX] = "flush_mmuidx", [VEV_FLUSH_MMUIDX_ALL] = "flush_mmuidx_allcpu",
++    [VEV_FLUSH_ASID] = "flush_asid_switch",
++    [VEV_FLUSH_PAGE] = "flush_page", [VEV_FLUSH_PAGE_ALL] = "flush_page_allcpu",
++    [VEV_FLUSH_RANGE] = "flush_range", [VEV_FLUSH_RANGE_ALL] = "flush_range_allcpu",
++    [VEV_TB_GEN] = "tb_gen", [VEV_TB_GEN_KCYC] = "tb_gen_kcycles",
++    [VEV_NOTDIRTY] = "notdirty_write", [VEV_MMIO] = "mmio",
++    [VEV_RANGE_FULL_SIZE] = "range_full_size", [VEV_RANGE_FULL_LARGE] = "range_full_large",
++    [VEV_PAGE_FULL_LARGE] = "page_full_large", [VEV_FLUSHIDX_ALL] = "flushidx_all",
++    [VEV_FLUSHIDX_ONE] = "flushidx_one", [VEV_FLUSHIDX_OTHER] = "flushidx_other",
++    [VEV_RANGE_BY_LOG] = "range_by_log",
++    [VEV_ASID_RECENT8] = "asid_recent8", [VEV_ASID_KEY_RECENT8] = "asid_sprr_recent8",
++    [VEV_SPRR_EL0_FLUSH] = "sprr_el0_flush", [VEV_SPRR_EL1_FLUSH] = "sprr_el1_flush",
++    [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush",
++};
++
++void vphone_ev_register(void)
++{
++    unsigned long long *a = g_new0(unsigned long long, VEV_MAX);
++
++    qemu_mutex_lock(&vev_lock);
++    if (vev_nthreads < VEV_THREADS) {
++        vev_arrays[vev_nthreads++] = a;
++    }
++    qemu_mutex_unlock(&vev_lock);
++    vphone_ev_tls = a;
++}
++
++static void *vev_logger(void *opaque)
++{
++    unsigned long long prev[VEV_MAX] = { 0 }, sum[VEV_MAX];
++    struct timespec t0;
++
++    clock_gettime(CLOCK_MONOTONIC, &t0);
++    for (;;) {
++        struct timespec now;
++        GString *line = g_string_new(NULL);
++
++        g_usleep(vev_period * G_USEC_PER_SEC);
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        memset(sum, 0, sizeof(sum));
++        qemu_mutex_lock(&vev_lock);
++        for (int t = 0; t < vev_nthreads; t++) {
++            for (int k = 0; k < VEV_MAX; k++) {
++                sum[k] += qatomic_read(&vev_arrays[t][k]);
++            }
++        }
++        qemu_mutex_unlock(&vev_lock);
++        g_string_printf(line, "vphone-ev t=%ld", (long)(now.tv_sec - t0.tv_sec));
++        for (int k = 0; k < VEV_MAX; k++) {
++            unsigned long long r = (sum[k] - prev[k]) / vev_period;
++
++            if (k < VEV_FILLX) {
++                g_string_append_printf(line, " %s=%llu", vev_names[k], r);
++            } else if (r) {
++                g_string_append_printf(line, " fill_i%d_%s=%llu", (k - VEV_FILLX) / 2,
++                                       (k - VEV_FILLX) & 1 ? "hi" : "lo", r);
++            }
++            prev[k] = sum[k];
++        }
++        fprintf(stderr, "%s\n", line->str);
++        g_string_free(line, true);
++    }
++    return NULL;
++}
++
++static void __attribute__((constructor)) vev_init(void)
++{
++    const char *e = getenv("VPHONE_EVENT_STATS");
++    QemuThread th;
++
++    if (!e || !*e || atoi(e) <= 0) {
++        return;
++    }
++    vev_period = atoi(e);
++    qemu_mutex_init(&vev_lock);
++    vphone_ev_on = 1;
++    qemu_thread_create(&th, "vphone-ev", vev_logger, NULL, QEMU_THREAD_DETACHED);
++}
+-- 
+2.47.0.windows.2
+

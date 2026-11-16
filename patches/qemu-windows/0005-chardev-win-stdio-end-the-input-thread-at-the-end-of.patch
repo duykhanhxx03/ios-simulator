@@ -1,0 +1,43 @@
+From b11ed48e882249def59c1e578122fab9f830e85a Mon Sep 17 00:00:00 2001
+From: duykhanhxx03 <duykhanhxx03@gmail.com>
+Date: Sat, 14 Nov 2026 21:40:27 +0700
+Subject: [PATCH 5/5] chardev/win-stdio: end the input thread at the end of a
+ non-console stdin
+
+A read of no bytes from a pipe, a file or NUL is the end of the input and
+never blocks again: the thread spun a host CPU for the whole run when QEMU
+was started with stdin redirected (a background launch).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ chardev/char-win-stdio.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/chardev/char-win-stdio.c b/chardev/char-win-stdio.c
+index bb9c195..a2bf9f2 100644
+--- a/chardev/char-win-stdio.c
++++ b/chardev/char-win-stdio.c
+@@ -89,13 +89,15 @@ static DWORD WINAPI win_stdio_thread(LPVOID param)
+         /* Wait for one byte */
+         ret = ReadFile(stdio->hStdIn, &stdio->win_stdio_buf, 1, &dwSize, NULL);
+ 
+-        /* Exit in case of error, continue if nothing read */
+-        if (!ret) {
++        /*
++         * Exit in case of error or end of file. This thread serves a stdin
++         * that is not a console (a pipe, a file or NUL), where a read of no
++         * bytes is the end of the input: it never blocks again, so going on
++         * would spin a host CPU for the rest of the run.
++         */
++        if (!ret || !dwSize) {
+             break;
+         }
+-        if (!dwSize) {
+-            continue;
+-        }
+ 
+         /* Some terminal emulator returns \r\n for Enter, just pass \n */
+         if (stdio->win_stdio_buf == '\r') {
+-- 
+2.47.0.windows.2
+

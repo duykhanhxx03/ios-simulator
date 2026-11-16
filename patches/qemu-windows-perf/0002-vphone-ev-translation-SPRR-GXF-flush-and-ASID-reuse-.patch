@@ -1,0 +1,228 @@
+From 2e35320f30dc9af61267ae7f2ba853c24ce13665 Mon Sep 17 00:00:00 2001
+From: YahiaAngelo <yahia.mostafa.elsayed@gmail.com>
+Date: Wed, 11 Nov 2026 16:59:31 +0200
+Subject: [PATCH 2/8] vphone-ev: translation, SPRR/GXF flush and ASID reuse
+ diagnostics
+
+More VPHONE_EVENT_STATS counters (off by default):
+- tb_first / tb_again_samekey / tb_again_variant: whether a translation's
+  guest physical PC was translated before, with the same flags (redone after
+  a TB flush) or other ones; tb_crosspage, tb_race (tb_link_page found an
+  existing TB), tb_oneinsn, tb_inval, tb_inval_dma_calls, tb_flush;
+- range_full_size / range_full_large / page_full_large: range and page
+  flushes escalated to whole-index flushes; flushidx_all/one/other;
+- sprr_el0_flush, sprr_el1_flush, gxf_eret_flush: TLB flushes from Apple
+  SPRR permission changes and GXF erets;
+- asid_recent8 / asid_sprr_recent8: switches to one of the last 8 ASIDs.
+
+Findings on the iPhone Duo (iOS 27.1): 33-50% of translations during boot and
+app launches redo a TB lost to a full TB flush (the 2 GB code buffer fills
+every 1-2 minutes: median TB 2 guest instructions, ~300 host bytes); 61-72%
+of ASID switches return to one of the last 8 ASIDs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N89PWg24VJrcxX3MuUo4uM
+---
+ accel/tcg/tb-maint.c      |  3 ++
+ accel/tcg/translate-all.c | 78 +++++++++++++++++++++++++++++++++++++++
+ include/qemu/vphone-ev.h  |  7 +++-
+ system/physmem.c          |  2 +
+ util/vphone-ev.c          |  6 ++-
+ 5 files changed, 93 insertions(+), 3 deletions(-)
+
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index cf915fd..ddab475 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -34,6 +34,7 @@
+ #include "tb-internal.h"
+ #include "internal-common.h"
+ #include "system/runstate.h"
++#include "qemu/vphone-ev.h"
+ 
+ 
+ /* List iterators for lists of tagged pointers in TranslationBlock. */
+@@ -692,6 +693,7 @@ void tb_flush__exclusive_or_serial(void)
+     tcg_region_reset_all();
+     /* XXX: flush processor icache at this point if cache flush is expensive */
+     qatomic_inc(&tb_ctx.tb_flush_count);
++    vphone_ev(VEV_TB_FLUSH);
+ }
+ 
+ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+@@ -846,6 +848,7 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
+  */
+ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
+ {
++    vphone_ev(VEV_TB_INVAL);
+     uint32_t h;
+     tb_page_addr_t phys_pc;
+     uint32_t orig_cflags = tb_cflags(tb);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 1fcbeb3..f54b776 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -258,6 +258,76 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
+ 
+ static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s);
+ 
++/*
++ * vphone diagnostic: has this guest physical PC been translated before, with
++ * the same flags (a translation thrown away and redone) or other ones (a
++ * variant)? Two open-addressing sets of 2^22 keys; full probes are not counted.
++ */
++#define VTB_BITS 22
++static uint64_t *vtb_pc, *vtb_key;
++
++static bool vtb_insert(uint64_t *tab, uint64_t key)
++{
++    uint64_t h = (key * 0x9e3779b97f4a7c15ull) >> (64 - VTB_BITS);
++
++    for (int i = 0; i < 32; i++, h = (h + 1) & ((1u << VTB_BITS) - 1)) {
++        uint64_t cur = qatomic_read(&tab[h]);
++
++        if (cur == key) {
++            return false;
++        }
++        if (cur == 0 && qatomic_cmpxchg(&tab[h], 0, key) == 0) {
++            return true;
++        }
++        if (qatomic_read(&tab[h]) == key) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static void vtb_classify(TranslationBlock *tb, TCGTBCPUState s)
++{
++    tb_page_addr_t phys = tb_page_addr0(tb);
++    uint64_t k1, k2;
++
++    if (phys == -1) {
++        return;
++    }
++    if (unlikely(!qatomic_read(&vtb_pc))) {
++        uint64_t *a = g_new0(uint64_t, 1u << VTB_BITS);
++        uint64_t *b = g_new0(uint64_t, 1u << VTB_BITS);
++
++        if (qatomic_cmpxchg(&vtb_key, NULL, b) != NULL) {
++            g_free(b);
++        }
++        if (qatomic_cmpxchg(&vtb_pc, NULL, a) != NULL) {
++            g_free(a);
++        }
++        if (!qatomic_read(&vtb_key)) {
++            return;
++        }
++    }
++    k1 = ((uint64_t)phys | (s.pc & ~TARGET_PAGE_MASK)) + 1;
++    k2 = (k1 * 0xff51afd7ed558ccdull) ^ ((uint64_t)s.flags << 32 | s.cflags) ^
++         (s.cs_base * 0xc4ceb9fe1a85ec53ull);
++    k2 |= 1;
++    if (vtb_insert(vtb_pc, k1)) {
++        vtb_insert(vtb_key, k2);
++        vphone_ev(VEV_TB_FIRST);
++    } else if (vtb_insert(vtb_key, k2)) {
++        vphone_ev(VEV_TB_VARIANT);
++    } else {
++        vphone_ev(VEV_TB_SAMEKEY);
++        if (tb_page_addr1(tb) != -1) {
++            vphone_ev(VEV_TB_SAMEKEY_XPAGE);
++        }
++    }
++    if (tb_page_addr1(tb) != -1) {
++        vphone_ev(VEV_TB_XPAGE);
++    }
++}
++
+ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+ {
+     if (unlikely(vphone_ev_on)) {
+@@ -266,6 +336,12 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+ 
+         vphone_ev(VEV_TB_GEN);
+         vphone_ev_add(VEV_TB_GEN_KCYC, (__builtin_ia32_rdtsc() - t0) / 1000);
++        if (tb) {
++            vtb_classify(tb, s);
++            if ((s.cflags & CF_COUNT_MASK) == 1) {
++                vphone_ev(VEV_TB_ONEINSN);
++            }
++        }
+         return tb;
+     }
+     return tb_gen_code_inner(cpu, s);
+@@ -543,6 +619,8 @@ static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
+     if (unlikely(existing_tb != tb)) {
+         uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
+ 
++        vphone_ev(VEV_TB_RACE);
++
+         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
+         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+         tcg_tb_remove(tb);
+diff --git a/include/qemu/vphone-ev.h b/include/qemu/vphone-ev.h
+index 7dd31bd..a7986a8 100644
+--- a/include/qemu/vphone-ev.h
++++ b/include/qemu/vphone-ev.h
+@@ -2,7 +2,9 @@
+  * vphone diagnostic (VPHONE_EVENT_STATS=<seconds>): per-second rates of guest events that
+  * leave translated code (exceptions by kind, GXF enter/exit, ERET), TLB fills and flushes,
+  * translations, MMIO and code-page writes. Each thread counts into its own array; a logger
+- * thread prints the sums to stderr every <seconds>. Off by default: one predictable branch.
++ * thread prints the sums to stderr every <seconds>, as per-second rates rounded down (an event
++ * rarer than once per <seconds> shows as 0: use a longer period, or "info jit" for TB flushes).
++ * Off by default: one predictable branch.
+  *
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+@@ -19,7 +21,8 @@ enum {
+     VEV_RANGE_FULL_SIZE, VEV_RANGE_FULL_LARGE, VEV_PAGE_FULL_LARGE,
+     VEV_FLUSHIDX_ALL, VEV_FLUSHIDX_ONE, VEV_FLUSHIDX_OTHER, VEV_RANGE_BY_LOG,
+     VEV_ASID_RECENT8, VEV_ASID_KEY_RECENT8, VEV_SPRR_EL0_FLUSH, VEV_SPRR_EL1_FLUSH,
+-    VEV_GXF_ERET_FLUSH,
++    VEV_GXF_ERET_FLUSH, VEV_TB_FIRST, VEV_TB_SAMEKEY, VEV_TB_VARIANT,
++    VEV_TB_XPAGE, VEV_TB_SAMEKEY_XPAGE, VEV_TB_RACE, VEV_TB_ONEINSN, VEV_TB_INVAL, VEV_TB_INVAL_DMA, VEV_TB_FLUSH,
+     /* TLB fills per (core mmu_idx & 31) * 2 + (address bit 63) */
+     VEV_FILLX, VEV_FILLX_END = VEV_FILLX + 64,
+     VEV_MAX = VEV_FILLX_END
+diff --git a/system/physmem.c b/system/physmem.c
+index aafd55e..de49176 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/vphone-ev.h"
+ #include "exec/page-vary.h"
+ #include "qapi/error.h"
+ 
+@@ -2813,6 +2814,7 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
+     }
+     if (dirty_log_mask & (1 << DIRTY_MEMORY_CODE)) {
+         assert(tcg_enabled());
++        vphone_ev(VEV_TB_INVAL_DMA);
+         tb_invalidate_phys_range(NULL, addr, addr + length - 1);
+         dirty_log_mask &= ~(1 << DIRTY_MEMORY_CODE);
+     }
+diff --git a/util/vphone-ev.c b/util/vphone-ev.c
+index eac4251..7030c57 100644
+--- a/util/vphone-ev.c
++++ b/util/vphone-ev.c
+@@ -36,7 +36,11 @@ static const char *const vev_names[VEV_MAX] = {
+     [VEV_RANGE_BY_LOG] = "range_by_log",
+     [VEV_ASID_RECENT8] = "asid_recent8", [VEV_ASID_KEY_RECENT8] = "asid_sprr_recent8",
+     [VEV_SPRR_EL0_FLUSH] = "sprr_el0_flush", [VEV_SPRR_EL1_FLUSH] = "sprr_el1_flush",
+-    [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush",
++    [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush", [VEV_TB_FIRST] = "tb_first",
++    [VEV_TB_SAMEKEY] = "tb_again_samekey", [VEV_TB_VARIANT] = "tb_again_variant",
++    [VEV_TB_XPAGE] = "tb_crosspage", [VEV_TB_SAMEKEY_XPAGE] = "tb_again_samekey_crosspage",
++    [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
++    [VEV_TB_INVAL_DMA] = "tb_inval_dma_calls", [VEV_TB_FLUSH] = "tb_flush",
+ };
+ 
+ void vphone_ev_register(void)
+-- 
+2.47.0.windows.2
+

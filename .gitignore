@@ -1,0 +1,10 @@
+# Third-party clones (vphone-linux, QEMU, reims-vgpu, metal2vulkan, ...): fetch them from their
+# own repositories; our changes to them live in patches/.
+refs/
+# Build outputs and run logs
+target/
+*.exe
+*.obj
+*.pdb
+runs/
+__pycache__/

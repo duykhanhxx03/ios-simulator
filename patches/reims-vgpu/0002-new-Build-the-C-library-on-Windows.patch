@@ -1,0 +1,683 @@
+From 7657907486bf0ff585d75659bb7fa14b1a7700d9 Mon Sep 17 00:00:00 2001
+From: virt-ios <virt-ios@localhost>
+Date: Sat, 14 Nov 2026 13:12:00 +0700
+Subject: [PATCH 2/4] :new: Build the C library on Windows
+
+The whole library builds for x86_64-pc-windows-msvc with the vulkan
+feature: reims-vgpu-c, reims-vgpu, reims-vgpu-window and the Vulkan crate.
+
+- reims-vgpu-window: the SDL3 window serves Windows too (native/linux is
+  SDL's, not Linux's); the control socket is Unix-only and logged off.
+- reims-graphics (x86-64 macOS guests: a BAR region, a doorbell fd) is a
+  Unix-only dependency. On Windows the C API keeps its constants, types
+  and functions (graphics_windows.rs) and rvg_graphics_device_create
+  answers RVG_ERR_UNSUPPORTED, so hosts link unchanged.
+- reims-vgpu: DefaultPlatform is VulkanPlatform on Windows; KVM's dirty
+  log answers no slot off Linux; graphics_video is Unix-only; the window's
+  swapchain sink is built on Windows.
+- reims-vgpu-c: a memory range file's fd is the section HANDLE on Windows
+  (handles are 32-bit significant), duplicated with DuplicateHandle into
+  a winvm::Section; its size is not checked (no public call reads it);
+  ffi's catch is std's catch_unwind, as on Linux.
+
+Verified: cargo check -p reims-vgpu-c --features vulkan on Windows,
+0 errors. Not yet: the static library for QEMU (windows-gnu), tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu-c/Cargo.toml                |  11 +-
+ crates/reims-vgpu-c/src/device.rs             |  49 +++++
+ crates/reims-vgpu-c/src/ffi/catch.rs          |   4 +-
+ crates/reims-vgpu-c/src/graphics_windows.rs   | 198 ++++++++++++++++++
+ crates/reims-vgpu-c/src/lib.rs                |   7 +-
+ crates/reims-vgpu-window/Cargo.toml           |   2 +-
+ crates/reims-vgpu-window/src/handle.rs        |   2 +-
+ crates/reims-vgpu-window/src/native.rs        |   6 +-
+ .../src/native/linux/control.rs               |  19 +-
+ crates/reims-vgpu-winvm/src/lib.rs            |   9 +
+ crates/reims-vgpu/Cargo.toml                  |   6 +-
+ crates/reims-vgpu/src/device.rs               |   4 +
+ crates/reims-vgpu/src/dirty.rs                |  17 +-
+ crates/reims-vgpu/src/lib.rs                  |  11 +-
+ crates/reims-vgpu/src/platform.rs             |   4 +-
+ crates/reims-vgpu/src/platform/vulkan.rs      |   1 +
+ crates/reims-vgpu/src/window/vulkan.rs        |   2 +-
+ 17 files changed, 333 insertions(+), 19 deletions(-)
+ create mode 100644 crates/reims-vgpu-c/src/graphics_windows.rs
+
+diff --git a/crates/reims-vgpu-c/Cargo.toml b/crates/reims-vgpu-c/Cargo.toml
+index 5bc41ed5..f6bd3e24 100644
+--- a/crates/reims-vgpu-c/Cargo.toml
++++ b/crates/reims-vgpu-c/Cargo.toml
+@@ -26,7 +26,6 @@ vulkan = ["reims-vgpu/vulkan"]
+ [dependencies]
+ reims-vgpu.workspace = true
+ # The graphics device's wire constants, which the C API's PCI constants are checked against.
+-reims-graphics.workspace = true
+ # The platform trait's associated types (the unit tests' testkit platform stands where
+ # MetalPlatform stands in the product), and the log hook.
+ reims-vgpu-core.workspace = true
+@@ -53,3 +52,13 @@ objc2-foundation.workspace = true
+ 
+ [lints]
+ workspace = true
++
++# The reims-graphics device (x86-64 macOS guests) is Unix-only: on Windows its C API answers
++# RVG_ERR_UNSUPPORTED (reims-vgpu-c's graphics_windows.rs).
++[target.'cfg(unix)'.dependencies]
++reims-graphics.workspace = true
++
++# Windows: the guest RAM's sections a host hands over (device.rs's `duplicate`).
++[target.'cfg(windows)'.dependencies]
++winvm = { package = "reims-vgpu-winvm", path = "../reims-vgpu-winvm" }
++windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_SystemInformation"] }
+diff --git a/crates/reims-vgpu-c/src/device.rs b/crates/reims-vgpu-c/src/device.rs
+index 879bd053..1ba64de4 100644
+--- a/crates/reims-vgpu-c/src/device.rs
++++ b/crates/reims-vgpu-c/src/device.rs
+@@ -7,8 +7,10 @@
+ //! `ffi::host_call`: a host function that raises ends the process at the call.
+ 
+ use std::ffi::c_void;
++#[cfg(unix)]
+ use std::mem::MaybeUninit;
+ use std::num::NonZeroU64;
++#[cfg(unix)]
+ use std::os::fd::{FromRawFd, OwnedFd};
+ use std::sync::Arc;
+ use std::time::Duration;
+@@ -536,8 +538,53 @@ fn file_refusal(r: &RvgMemoryRange, f: &RvgMemoryRangeFile, page: NonZeroU64) ->
+     None
+ }
+ 
++/// The host's page size on Windows (`GetSystemInfo`): 4 KiB on x86-64.
++#[cfg(windows)]
++fn host_page_size() -> NonZeroU64 {
++    NonZeroU64::new(winvm::page_size()).unwrap_or(NonZeroU64::MIN)
++}
++
++/// The size of the section whose handle `fd` holds, on Windows: no public call reads a section's
++/// size, so none is checked here (u64::MAX); a view past its end fails when it is mapped.
++#[cfg(windows)]
++#[expect(clippy::unnecessary_wraps, reason = "the Unix version's signature")]
++fn file_size(_fd: i32) -> std::io::Result<u64> {
++    Ok(u64::MAX)
++}
++
++/// A duplicate of the section handle `fd` holds (`DuplicateHandle`, same access, not inherited),
++/// which the map holds. On Windows a memory range file's `fd` is the section's HANDLE: Windows
++/// handles are 32-bit significant (sign-extended), so they fit the field (docs/api.md).
++#[cfg(windows)]
++fn duplicate(fd: i32) -> std::io::Result<winvm::Section> {
++    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
++    use windows_sys::Win32::System::Threading::GetCurrentProcess;
++    // Sign-extended back to the pointer-sized handle, as WOW64's handle rules specify.
++    let source: HANDLE = std::ptr::without_provenance_mut(isize::try_from(fd).unwrap_or(-1).cast_unsigned());
++    let mut new: HANDLE = std::ptr::null_mut();
++    // SAFETY: duplicates a handle of this process into this process; an invalid handle is an
++    // error the call returns.
++    let ok = unsafe {
++        DuplicateHandle(
++            GetCurrentProcess(),
++            source,
++            GetCurrentProcess(),
++            &mut new,
++            0,
++            0,
++            DUPLICATE_SAME_ACCESS,
++        )
++    };
++    if ok == 0 {
++        return Err(std::io::Error::last_os_error());
++    }
++    // SAFETY: `new` is a section handle this call opened, owned by nothing else.
++    Ok(unsafe { winvm::Section::own_raw(new, u64::MAX) })
++}
++
+ /// The host's page size (`sysconf(_SC_PAGESIZE)`, which does not fail): 16 KiB on arm64 macOS,
+ /// 4 KiB on x86-64.
++#[cfg(unix)]
+ fn host_page_size() -> NonZeroU64 {
+     // SAFETY: a query of a constant; it reads and writes no memory of the caller's.
+     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+@@ -548,6 +595,7 @@ fn host_page_size() -> NonZeroU64 {
+ }
+ 
+ /// The size of the file `fd` names (`fstat`).
++#[cfg(unix)]
+ fn file_size(fd: i32) -> std::io::Result<u64> {
+     let mut st = MaybeUninit::<libc::stat>::zeroed();
+     // SAFETY: `st` is a writable `struct stat`; an `fd` that names no open file is an error the
+@@ -561,6 +609,7 @@ fn file_size(fd: i32) -> std::io::Result<u64> {
+ }
+ 
+ /// A duplicate of `fd`, close-on-exec (`fcntl(F_DUPFD_CLOEXEC)`), which the map holds.
++#[cfg(unix)]
+ fn duplicate(fd: i32) -> std::io::Result<OwnedFd> {
+     // SAFETY: `fcntl` reads and writes no memory of the caller's; an `fd` that names no open
+     // file is an error the call returns.
+diff --git a/crates/reims-vgpu-c/src/ffi/catch.rs b/crates/reims-vgpu-c/src/ffi/catch.rs
+index 599c7a0a..a444df64 100644
+--- a/crates/reims-vgpu-c/src/ffi/catch.rs
++++ b/crates/reims-vgpu-c/src/ffi/catch.rs
+@@ -1,12 +1,12 @@
+ //! The catch around a call of a host function ([`super::host_call`]), in one file per OS with the
+ //! same function: `catch(f)` runs `f` and answers its value, or `Err(())` for what the host threw.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ pub(super) use linux::catch;
+ #[cfg(target_os = "macos")]
+ pub(super) use macos::catch;
+diff --git a/crates/reims-vgpu-c/src/graphics_windows.rs b/crates/reims-vgpu-c/src/graphics_windows.rs
+new file mode 100644
+index 00000000..c4cc2f8a
+--- /dev/null
++++ b/crates/reims-vgpu-c/src/graphics_windows.rs
+@@ -0,0 +1,198 @@
++//! The reims-graphics device's C API on Windows: the same constants, types and functions as
++//! `graphics.rs`, so a host links unchanged, but no device. The device serves x86-64 macOS
++//! guests over a PCI BAR region and a doorbell fd (`reims-graphics`), which is Unix-only; vphone
++//! (`apple-gfx-mmio`) does not use it. `rvg_graphics_device_create` answers
++//! RVG_ERR_UNSUPPORTED, so no handle ever exists for the other functions.
++
++use std::ffi::c_void;
++
++use crate::device::{RvgMemoryMap, RvgMemoryRangeFile};
++use crate::sized::HostStruct;
++use crate::status::{RVG_ERR_UNSUPPORTED, RvgStatus};
++use crate::table::RvgDestroyFn;
++use crate::window::RvgWindowConfig;
++
++/// The PCI vendor ID of the graphics device: a placeholder until its own is picked.
++pub const RVG_GRAPHICS_PCI_VENDOR_ID: u16 = 0x1234;
++/// The PCI device ID of the graphics device: a placeholder, as the vendor ID is.
++pub const RVG_GRAPHICS_PCI_DEVICE_ID: u16 = 0x5247;
++/// The PCI class of the graphics device: a display controller of class "other".
++pub const RVG_GRAPHICS_PCI_CLASS: u16 = 0x0380;
++/// The BAR of the graphics device's registers.
++pub const RVG_GRAPHICS_PCI_BAR_REGISTERS: u32 = 0;
++/// The size of BAR 0.
++pub const RVG_GRAPHICS_REGISTERS_SIZE: u32 = 0x1000;
++/// Where in BAR 0 the MSI-X table starts.
++pub const RVG_GRAPHICS_MSIX_OFFSET: u32 = 0x800;
++/// The graphics device's MSI-X vectors.
++pub const RVG_GRAPHICS_MSIX_VECTORS: u32 = 1;
++/// The BAR of the graphics device's region.
++pub const RVG_GRAPHICS_PCI_BAR_REGION: u32 = 2;
++/// The register the guest writes a ring's id to as its doorbell.
++pub const RVG_GRAPHICS_REG_DOORBELL: u32 = 0x020;
++/// The control ring's id.
++pub const RVG_GRAPHICS_DOORBELL_CONTROL: u32 = 0;
++/// Where the guest's allocations start in the region.
++pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x40_0000;
++
++/// `raise_interrupt(ctx, vector)`, as on Unix (never called here).
++pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, vector: u32)>;
++
++/// `scanout_written(ctx, offset, length)`, as on Unix (never called here).
++pub type RvgGraphicsScanoutWrittenFn =
++    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, offset: u64, length: u64) -> bool>;
++
++/// The graphics device's callbacks, laid out as on Unix.
++#[repr(C)]
++#[derive(Clone, Copy)]
++#[expect(
++    missing_docs,
++    reason = "the fields' names say what they hold, as the header shows them"
++)]
++pub struct RvgGraphicsCallbacks {
++    /// sizeof(RvgGraphicsCallbacks) as the host was compiled.
++    pub struct_size: u32,
++    pub ctx: *mut c_void,
++    pub destroy: RvgDestroyFn,
++    pub raise_interrupt: RvgGraphicsRaiseFn,
++    pub scanout_written: RvgGraphicsScanoutWrittenFn,
++}
++
++// SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
++unsafe impl HostStruct for RvgGraphicsCallbacks {}
++
++/// The graphics device's config, laid out as on Unix.
++#[repr(C)]
++#[derive(Clone, Copy)]
++#[expect(
++    missing_docs,
++    reason = "the fields' names say what they hold, as the header shows them"
++)]
++pub struct RvgGraphicsDeviceConfig {
++    /// sizeof(RvgGraphicsDeviceConfig) as the host was compiled.
++    pub struct_size: u32,
++    pub callbacks: *const RvgGraphicsCallbacks,
++    pub window: *const RvgWindowConfig,
++    pub memory_map: *const RvgMemoryMap,
++    pub memory_files: *const RvgMemoryRangeFile,
++}
++
++// SAFETY: repr(C), a u32 first; pointers.
++unsafe impl HostStruct for RvgGraphicsDeviceConfig {
++    const V1_SIZE: usize = 24;
++}
++
++/// The graphics device: none is ever made on Windows.
++pub struct RvgGraphicsDevice {
++    _none: std::convert::Infallible,
++}
++
++/// RVG_ERR_UNSUPPORTED on Windows, `*device` NULL where it is writable. The config is not read,
++/// so no table's destroy runs, as for a refusal before the tables are the library's.
++///
++/// # Safety
++/// `config` is NULL or a live config; `device` is NULL or writable.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_create(
++    _config: *const RvgGraphicsDeviceConfig,
++    device: *mut *mut RvgGraphicsDevice,
++) -> RvgStatus {
++    if !device.is_null() {
++        // SAFETY: the caller's contract: writable.
++        unsafe { device.write(std::ptr::null_mut()) };
++    }
++    RVG_ERR_UNSUPPORTED
++}
++
++/// Nothing to release: no device exists on Windows.
++///
++/// # Safety
++/// `device` is NULL (no handle is ever made here).
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_release(_device: *mut RvgGraphicsDevice) {}
++
++/// NULL, `*size` 0: no device exists on Windows.
++///
++/// # Safety
++/// `size` is NULL or writable.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_region(
++    _device: *const RvgGraphicsDevice,
++    size: *mut u64,
++) -> *mut c_void {
++    if !size.is_null() {
++        // SAFETY: the caller's contract: writable.
++        unsafe { size.write(0) };
++    }
++    std::ptr::null_mut()
++}
++
++/// 0: no device exists on Windows.
++///
++/// # Safety
++/// None: the handle is not read.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_mmio_read(
++    _device: *mut RvgGraphicsDevice,
++    _offset: u64,
++) -> u32 {
++    0
++}
++
++/// Nothing: no device exists on Windows.
++///
++/// # Safety
++/// None: the handle is not read.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_mmio_write(
++    _device: *mut RvgGraphicsDevice,
++    _offset: u64,
++    _value: u32,
++) {
++}
++
++/// Nothing: no device exists on Windows.
++///
++/// # Safety
++/// None: the handle is not read.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_mmio_write_taking(
++    _device: *mut RvgGraphicsDevice,
++    _offset: u64,
++    _value: u32,
++) {
++}
++
++/// RVG_ERR_UNSUPPORTED: no device exists on Windows.
++///
++/// # Safety
++/// None: the handle is not read.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_set_doorbell(
++    _device: *mut RvgGraphicsDevice,
++    _fd: i32,
++) -> RvgStatus {
++    RVG_ERR_UNSUPPORTED
++}
++
++/// Nothing: no device exists on Windows.
++///
++/// # Safety
++/// None: the handle is not read.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_reset(_device: *mut RvgGraphicsDevice) {}
++
++/// RVG_ERR_UNSUPPORTED: no device exists on Windows.
++///
++/// # Safety
++/// None: nothing is read or written.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rvg_graphics_device_read_display(
++    _device: *mut RvgGraphicsDevice,
++    _dst: *mut u8,
++    _dst_length: usize,
++    _width: *mut u32,
++    _height: *mut u32,
++) -> RvgStatus {
++    RVG_ERR_UNSUPPORTED
++}
+diff --git a/crates/reims-vgpu-c/src/lib.rs b/crates/reims-vgpu-c/src/lib.rs
+index 368a9d2b..c3e2398c 100644
+--- a/crates/reims-vgpu-c/src/lib.rs
++++ b/crates/reims-vgpu-c/src/lib.rs
+@@ -38,7 +38,12 @@ pub mod window;
+ // The scaler device after the rest, so that the functions before it keep their places.
+ pub mod scaler;
+ 
+-// The graphics device after the scaler, for the same reason.
++// The graphics device after the scaler, for the same reason. Unix-only: on Windows the same
++// functions and constants answer RVG_ERR_UNSUPPORTED (`graphics_windows.rs`).
++#[cfg(unix)]
++pub mod graphics;
++#[cfg(windows)]
++#[path = "graphics_windows.rs"]
+ pub mod graphics;
+ 
+ mod ffi;
+diff --git a/crates/reims-vgpu-window/Cargo.toml b/crates/reims-vgpu-window/Cargo.toml
+index d5ea7726..bd2ab175 100644
+--- a/crates/reims-vgpu-window/Cargo.toml
++++ b/crates/reims-vgpu-window/Cargo.toml
+@@ -15,7 +15,7 @@ ash.workspace = true
+ 
+ # The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface, and the
+ # Vulkan crate's threads.
+-[target.'cfg(target_os = "linux")'.dependencies]
++[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+ reims-vgpu-vulkan.workspace = true
+ sdl3-sys.workspace = true
+ 
+diff --git a/crates/reims-vgpu-window/src/handle.rs b/crates/reims-vgpu-window/src/handle.rs
+index 65516df7..b7259a6c 100644
+--- a/crates/reims-vgpu-window/src/handle.rs
++++ b/crates/reims-vgpu-window/src/handle.rs
+@@ -829,7 +829,7 @@ mod tests {
+         }
+     }
+ 
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", windows))]
+     impl FrameSink for PositionSink {
+         fn presenter(
+             &self,
+diff --git a/crates/reims-vgpu-window/src/native.rs b/crates/reims-vgpu-window/src/native.rs
+index 14383946..4665cbd4 100644
+--- a/crates/reims-vgpu-window/src/native.rs
++++ b/crates/reims-vgpu-window/src/native.rs
+@@ -11,14 +11,14 @@
+ //!   the window's shell and cursor are SDL's shared ones (`sdl`), with Linux's side in
+ //!   `native/linux/sdl.rs`.
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ pub use linux::FrameSink;
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ pub(crate) use linux::{
+     Surface, close, cursor_changed, guest_mode_changed, host_screens, now, open, sdl as sdl_os,
+ };
+diff --git a/crates/reims-vgpu-window/src/native/linux/control.rs b/crates/reims-vgpu-window/src/native/linux/control.rs
+index 9e107a13..d983e98c 100644
+--- a/crates/reims-vgpu-window/src/native/linux/control.rs
++++ b/crates/reims-vgpu-window/src/native/linux/control.rs
+@@ -15,6 +15,7 @@
+ //! is connected or the client is gone.
+ 
+ use std::io::{BufRead, BufReader, Write};
++#[cfg(unix)]
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::{Path, PathBuf};
+ use std::sync::mpsc::{self, Sender};
+@@ -63,7 +64,20 @@ static SERVED: OnceLock<Option<Served>> = OnceLock::new();
+ pub(crate) fn start() {
+     SERVED.get_or_init(|| {
+         let path = std::env::var_os(CONTROL_VAR).filter(|p| !p.is_empty())?;
+-        serve(PathBuf::from(path))
++        #[cfg(unix)]
++        {
++            serve(PathBuf::from(path))
++        }
++        // No Unix socket in std on Windows: the windows go on without the control socket.
++        #[cfg(windows)]
++        {
++            log::warn!(
++                target: "reims_vgpu_window",
++                "{CONTROL_VAR}={}: the control socket is not served on Windows",
++                PathBuf::from(path).display()
++            );
++            None
++        }
+     });
+ }
+ 
+@@ -75,6 +89,7 @@ pub(crate) fn send(line: String) {
+ }
+ 
+ /// Binds the socket at `path` and starts its threads.
++#[cfg(unix)]
+ fn serve(path: PathBuf) -> Option<Served> {
+     // A file left by an earlier run: a socket bound there again would be refused.
+     let _ = std::fs::remove_file(&path);
+@@ -127,6 +142,7 @@ fn serve(path: PathBuf) -> Option<Served> {
+ }
+ 
+ /// Accepts each client in turn: the one before is shut down, and the new one read.
++#[cfg(unix)]
+ fn accept(listener: &UnixListener, client: &Mutex<Option<UnixStream>>) {
+     for stream in listener.incoming() {
+         let stream = match stream {
+@@ -154,6 +170,7 @@ fn accept(listener: &UnixListener, client: &Mutex<Option<UnixStream>>) {
+ }
+ 
+ /// Reads a client's lines until it is gone, posting each request to the UI thread.
++#[cfg(unix)]
+ fn read(stream: UnixStream) {
+     for line in BufReader::new(stream).lines() {
+         let Ok(line) = line else {
+diff --git a/crates/reims-vgpu-winvm/src/lib.rs b/crates/reims-vgpu-winvm/src/lib.rs
+index 7f52702c..d3308d38 100644
+--- a/crates/reims-vgpu-winvm/src/lib.rs
++++ b/crates/reims-vgpu-winvm/src/lib.rs
+@@ -101,6 +101,15 @@ impl Section {
+         Arc::new(Section { handle: sys::Handle(handle), len })
+     }
+ 
++    /// [`Section::from_raw`], unwrapped: for a holder that wraps it itself.
++    ///
++    /// # Safety
++    /// As [`Section::from_raw`].
++    #[cfg(windows)]
++    pub unsafe fn own_raw(handle: *mut std::ffi::c_void, len: u64) -> Section {
++        Section { handle: sys::Handle(handle), len }
++    }
++
+     pub fn len(&self) -> u64 {
+         self.len
+     }
+diff --git a/crates/reims-vgpu/Cargo.toml b/crates/reims-vgpu/Cargo.toml
+index f6ebabda..2c7681a4 100644
+--- a/crates/reims-vgpu/Cargo.toml
++++ b/crates/reims-vgpu/Cargo.toml
+@@ -37,7 +37,6 @@ ash = { workspace = true, optional = true }
+ # The video device's host session (`video`).
+ reims-vgpu-video-core.workspace = true
+ # The reims-graphics device's host side (`graphics`).
+-reims-graphics.workspace = true
+ # Reads the reims-graphics device's wire messages into their records (`graphics::decode`).
+ zerocopy.workspace = true
+ # A library's content key, by which the reims-graphics device keeps the libraries it made
+@@ -91,3 +90,8 @@ objc2-quartz-core = { workspace = true, features = [
+ 
+ [lints]
+ workspace = true
++
++# The reims-graphics device (x86-64 macOS guests) is Unix-only: on Windows its C API answers
++# RVG_ERR_UNSUPPORTED (reims-vgpu-c's graphics_windows.rs).
++[target.'cfg(unix)'.dependencies]
++reims-graphics.workspace = true
+diff --git a/crates/reims-vgpu/src/device.rs b/crates/reims-vgpu/src/device.rs
+index d5585891..3da3cacd 100644
+--- a/crates/reims-vgpu/src/device.rs
++++ b/crates/reims-vgpu/src/device.rs
+@@ -25,7 +25,11 @@
+ //! resume), so no wait inside one is left for a harvest, and retired with the lease.
+ 
+ use std::any::Any;
++#[cfg(unix)]
+ use std::os::fd::OwnedFd;
++// The file behind a range of guest RAM: a section on Windows (`reims_vgpu_vulkan::os::RamFile`).
++#[cfg(windows)]
++use reims_vgpu_vulkan::os::RamFile as OwnedFd;
+ use std::sync::Arc;
+ 
+ use reims_vgpu_core::device::Device as CoreDevice;
+diff --git a/crates/reims-vgpu/src/dirty.rs b/crates/reims-vgpu/src/dirty.rs
+index b7def649..77a38345 100644
+--- a/crates/reims-vgpu/src/dirty.rs
++++ b/crates/reims-vgpu/src/dirty.rs
+@@ -146,7 +146,14 @@ impl KvmLog for VmFd {
+         };
+         // SAFETY: KVM writes the slot's bitmap, a bit a page rounded up to a 64-bit word, which
+         // `bitmap` holds: the host's lock on its slots keeps the slot as listed.
+-        unsafe { libc::ioctl(self.0, KVM_GET_DIRTY_LOG as _, &raw mut log) == 0 }
++        #[cfg(target_os = "linux")]
++        return unsafe { libc::ioctl(self.0, KVM_GET_DIRTY_LOG as _, &raw mut log) == 0 };
++        // No KVM off Linux: the host passes no VM fd, so no slot is ever listed.
++        #[cfg(not(target_os = "linux"))]
++        {
++            let _ = &raw mut log;
++            false
++        }
+     }
+ 
+     fn clear(&self, slot: u32, first_page: u64, num_pages: u32, bitmap: &[u64]) -> bool {
+@@ -157,7 +164,13 @@ impl KvmLog for VmFd {
+             dirty_bitmap: bitmap.as_ptr(),
+         };
+         // SAFETY: KVM reads `num_pages` bits of `bitmap`, which holds them.
+-        unsafe { libc::ioctl(self.0, KVM_CLEAR_DIRTY_LOG as _, &raw mut log) == 0 }
++        #[cfg(target_os = "linux")]
++        return unsafe { libc::ioctl(self.0, KVM_CLEAR_DIRTY_LOG as _, &raw mut log) == 0 };
++        #[cfg(not(target_os = "linux"))]
++        {
++            let _ = &raw mut log;
++            false
++        }
+     }
+ }
+ 
+diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
+index 8e00fe24..63f82446 100644
+--- a/crates/reims-vgpu/src/lib.rs
++++ b/crates/reims-vgpu/src/lib.rs
+@@ -29,8 +29,8 @@
+ // limit of 128 (E0275), as the C crate's does.
+ #![recursion_limit = "256"]
+ 
+-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
+-compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
++#[cfg(all(any(target_os = "linux", windows), not(feature = "vulkan")))]
++compile_error!("on Linux and Windows the library is the Vulkan platform's: build it with the `vulkan` feature");
+ 
+ /// The unit tests' allocator, which counts a thread's allocations where a test asks.
+ #[cfg(test)]
+@@ -46,6 +46,8 @@ mod display;
+ mod entry;
+ mod error;
+ mod frame;
++/// The reims-graphics device (x86-64 macOS guests): Unix-only.
++#[cfg(unix)]
+ mod graphics;
+ mod iosurface;
+ pub mod platform;
+@@ -64,6 +66,7 @@ pub use display::{
+ };
+ pub use error::{Error, ResumeError};
+ pub use frame::{Frame, FrameTarget, MAX_FRAME_TARGET_SIZE, PixelFormat, Region};
++#[cfg(unix)]
+ pub use graphics::{
+     GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsVideo,
+     GraphicsVideoSession, ScanoutWrittenFn, VideoDecode, VideoPlane,
+@@ -93,8 +96,8 @@ pub use video::{
+ /// The platform every handle is made on by default: `MetalPlatform` on macOS.
+ #[cfg(target_os = "macos")]
+ pub type DefaultPlatform = MetalPlatform;
+-/// The platform every handle is made on by default: `VulkanPlatform` on Linux.
+-#[cfg(target_os = "linux")]
++/// The platform every handle is made on by default: `VulkanPlatform` on Linux and Windows.
++#[cfg(any(target_os = "linux", windows))]
+ pub type DefaultPlatform = VulkanPlatform;
+ pub use reims_vgpu_window::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+diff --git a/crates/reims-vgpu/src/platform.rs b/crates/reims-vgpu/src/platform.rs
+index f7baf9b7..284cc3a2 100644
+--- a/crates/reims-vgpu/src/platform.rs
++++ b/crates/reims-vgpu/src/platform.rs
+@@ -68,7 +68,9 @@ pub trait ApiPlatform: Platform {
+     }
+ 
+     /// The host's hardware video for a graphics device on `device`, the guest's video driver's
+-    /// (`crate::GraphicsVideo`); `None` where the platform has none, and by default.
++    /// (`crate::GraphicsVideo`); `None` where the platform has none, and by default. Unix-only,
++    /// as the graphics device is.
++    #[cfg(unix)]
+     fn graphics_video(&self, device: &Self::Device) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
+         let _ = device;
+         None
+diff --git a/crates/reims-vgpu/src/platform/vulkan.rs b/crates/reims-vgpu/src/platform/vulkan.rs
+index 6eda6ad7..2378add7 100644
+--- a/crates/reims-vgpu/src/platform/vulkan.rs
++++ b/crates/reims-vgpu/src/platform/vulkan.rs
+@@ -87,6 +87,7 @@ impl ApiPlatform for VulkanPlatform {
+     }
+ 
+     /// Vulkan Video on the device's video-decode queue (`graphics::vulkan::video`).
++    #[cfg(unix)]
+     fn graphics_video(
+         &self,
+         device: &<Self as Platform>::Device,
+diff --git a/crates/reims-vgpu/src/window/vulkan.rs b/crates/reims-vgpu/src/window/vulkan.rs
+index c16496af..cb356ea7 100644
+--- a/crates/reims-vgpu/src/window/vulkan.rs
++++ b/crates/reims-vgpu/src/window/vulkan.rs
+@@ -2,7 +2,7 @@
+ //! the window's swapchain, on either OS (`swapchain.rs`), and each OS's window asks the sink for
+ //! it its own way (`linux.rs`, `macos.rs`).
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", windows))]
+ mod linux;
+ #[cfg(target_os = "macos")]
+ mod macos;
+-- 
+2.47.0.windows.2
+

@@ -1,0 +1,403 @@
+From e24b790d057968cae750e697f0b419378f285627 Mon Sep 17 00:00:00 2001
+From: YahiaAngelo <yahia.mostafa.elsayed@gmail.com>
+Date: Wed, 11 Nov 2026 20:32:30 +0200
+Subject: [PATCH 4/8] tcg: recycle the oldest code regions when the buffer is
+ full (VPHONE_TB_RECYCLE)
+
+When the code buffer is full, QEMU flushes every TB. The iPhone guest fills
+the 2 GiB buffer every 1-2 minutes during boot and app launches (median TB 2
+guest instructions, ~400 host bytes), and 33-50% of its translations then
+redo TBs the flush threw away.
+
+With VPHONE_TB_RECYCLE=1 (or arm 1 of VPHONE_AB_WHAT=tb_recycle) the safe
+work queued on a full buffer instead invalidates the TBs of the oldest
+quarter of the regions (by allocation order, never a translation context's
+current one) with tb_phys_invalidate, clears the indirect-branch-cache and
+return-TB pointers of surviving TBs that point into them, flushes every jump
+cache (which also outdates the RAS), and hands the regions out again. Other
+flushes (A/B switch, gdbstub, ...) stay full flushes. Off by default.
+
+Boot + app phases on the Duo: 19 recycles of a quarter buffer, 13.8M TBs
+invalidated, apps render; translation cycles/s at boot 2.57G -> 1.96G, app
+launches 1.74G -> 1.03G (different runs). tests/tcg/vphone-* pass with it on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01N89PWg24VJrcxX3MuUo4uM
+---
+ accel/tcg/tb-maint.c      | 117 +++++++++++++++++++++++++++++++++++
+ accel/tcg/translate-all.c |   4 +-
+ include/exec/tb-flush.h   |   4 ++
+ include/qemu/vphone-ev.h  |   2 +-
+ include/tcg/tcg.h         |   6 ++
+ tcg/region.c              | 125 +++++++++++++++++++++++++++++++++++++-
+ util/vphone-ev.c          |   2 +-
+ 7 files changed, 253 insertions(+), 7 deletions(-)
+
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index ddab475..f5ceefc 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -35,6 +35,7 @@
+ #include "internal-common.h"
+ #include "system/runstate.h"
+ #include "qemu/vphone-ev.h"
++#include "qemu/vphone-ab.h"
+ 
+ 
+ /* List iterators for lists of tagged pointers in TranslationBlock. */
+@@ -704,6 +705,122 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+     }
+ }
+ 
++/*
++ * vphone-linux region recycling (VPHONE_TB_RECYCLE=1, or arm 1 of
++ * VPHONE_AB_WHAT=tb_recycle): when the code buffer is full, invalidate the
++ * TBs of the oldest quarter of its regions and reuse those regions, instead
++ * of flushing every TB. Hot code then survives a full buffer (the iPhone
++ * guest fills 2 GiB every 1-2 minutes during boot and app launches, and a
++ * flush made ~40% of its translations redo work). Besides QEMU's own links
++ * (unlinked by tb_phys_invalidate), the jump caches and the RAS (flushed,
++ * which also outdates the RAS stamp) and the TB pointers of the indirect-
++ * branch cache and of call sites' return TBs into those regions (cleared in
++ * every surviving TB) must not outlive them. Runs as safe work: no vCPU is in
++ * generated code or translating.
++ */
++static bool vphone_tb_recycle_on(void)
++{
++    static int on = -1;
++
++    if (unlikely(on < 0)) {
++        const char *e = getenv("VPHONE_TB_RECYCLE");
++        on = e && *e && *e != '0';
++    }
++    return on || vphone_ab("tb_recycle");
++}
++
++typedef struct {
++    size_t n;
++    uintptr_t lo[64], hi[64];
++} VphoneRecycleRanges;
++
++static bool vr_in(const VphoneRecycleRanges *r, const void *p)
++{
++    for (size_t i = 0; i < r->n; i++) {
++        if ((uintptr_t)p >= r->lo[i] && (uintptr_t)p < r->hi[i]) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static gboolean vr_collect(gpointer key, gpointer value, gpointer data)
++{
++    g_ptr_array_add(data, value);
++    return FALSE;
++}
++
++static gboolean vr_fix(gpointer key, gpointer value, gpointer data)
++{
++    TranslationBlock *tb = value;
++
++    if (tb->vphone_ibr_tb && vr_in(data, tb->vphone_ibr_tb)) {
++        qatomic_set(&tb->vphone_ibr_tb, NULL);
++    }
++    if (tb->vphone_ret_tb && vr_in(data, tb->vphone_ret_tb)) {
++        qatomic_set(&tb->vphone_ret_tb, NULL);
++    }
++    return FALSE;
++}
++
++static bool tb_recycle__exclusive(void)
++{
++    size_t idx[64];
++    size_t n = MIN(tcg_region_count(), 64), got;
++    VphoneRecycleRanges r = { 0 };
++    g_autoptr(GPtrArray) tbs = g_ptr_array_new();
++    CPUState *cpu;
++
++    if (n < 4) {
++        return false;
++    }
++    got = tcg_region_recycle_pick(n / 4, idx);
++    if (!got) {
++        return false;
++    }
++    for (size_t i = 0; i < got; i++) {
++        void *start, *end;
++
++        tcg_region_recycle_bounds(idx[i], &start, &end);
++        r.lo[r.n] = (uintptr_t)start;
++        r.hi[r.n++] = (uintptr_t)end;
++        tcg_region_recycle_foreach(idx[i], vr_collect, tbs);
++    }
++    for (guint i = 0; i < tbs->len; i++) {
++        tb_phys_invalidate(g_ptr_array_index(tbs, i), -1);
++    }
++    tcg_tb_foreach(vr_fix, &r);
++    CPU_FOREACH(cpu) {
++        tcg_flush_jmp_cache(cpu);
++    }
++    tcg_region_recycle_done(got, idx);
++    qatomic_inc(&tb_ctx.tb_flush_count);
++    vphone_ev(VEV_TB_RECYCLE);
++    return true;
++}
++
++/* The code buffer is full: recycle its oldest regions, or flush every TB. */
++void tb_recycle_or_flush__exclusive_or_serial(void)
++{
++    if (!vphone_tb_recycle_on() || !tb_recycle__exclusive()) {
++        tb_flush__exclusive_or_serial();
++    }
++}
++
++static void do_tb_recycle(CPUState *cpu, run_on_cpu_data tb_flush_count)
++{
++    if (tb_ctx.tb_flush_count == tb_flush_count.host_int) {
++        tb_recycle_or_flush__exclusive_or_serial();
++    }
++}
++
++void queue_tb_recycle(CPUState *cs)
++{
++    unsigned tb_flush_count = qatomic_read(&tb_ctx.tb_flush_count);
++
++    async_safe_run_on_cpu(cs, do_tb_recycle, RUN_ON_CPU_HOST_INT(tb_flush_count));
++}
++
+ void queue_tb_flush(CPUState *cs)
+ {
+     if (tcg_enabled()) {
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index f54b776..c149105 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -378,10 +378,10 @@ static TranslationBlock *tb_gen_code_inner(CPUState *cpu, TCGTBCPUState s)
+     if (unlikely(!tb)) {
+         /* flush must be done */
+         if (cpu_in_serial_context(cpu)) {
+-            tb_flush__exclusive_or_serial();
++            tb_recycle_or_flush__exclusive_or_serial();
+             goto buffer_overflow;
+         }
+-        queue_tb_flush(cpu);
++        queue_tb_recycle(cpu);
+ 
+         /* Make the execution loop process the flush as soon as possible.  */
+         cpu->exception_index = EXCP_INTERRUPT;
+diff --git a/include/exec/tb-flush.h b/include/exec/tb-flush.h
+index 15fe52b..00c11b4 100644
+--- a/include/exec/tb-flush.h
++++ b/include/exec/tb-flush.h
+@@ -33,6 +33,10 @@ void tb_flush__exclusive_or_serial(void);
+  */
+ void queue_tb_flush(CPUState *cs);
+ 
++/* vphone-linux: the code buffer is full (tb-maint.c, VPHONE_TB_RECYCLE). */
++void queue_tb_recycle(CPUState *cs);
++void tb_recycle_or_flush__exclusive_or_serial(void);
++
+ void tcg_flush_jmp_cache(CPUState *cs);
+ void tcg_stale_jmp_cache(CPUState *cs);
+ void tcg_switch_jmp_cache(CPUState *cs, uint32_t asid);
+diff --git a/include/qemu/vphone-ev.h b/include/qemu/vphone-ev.h
+index a7986a8..edfd279 100644
+--- a/include/qemu/vphone-ev.h
++++ b/include/qemu/vphone-ev.h
+@@ -22,7 +22,7 @@ enum {
+     VEV_FLUSHIDX_ALL, VEV_FLUSHIDX_ONE, VEV_FLUSHIDX_OTHER, VEV_RANGE_BY_LOG,
+     VEV_ASID_RECENT8, VEV_ASID_KEY_RECENT8, VEV_SPRR_EL0_FLUSH, VEV_SPRR_EL1_FLUSH,
+     VEV_GXF_ERET_FLUSH, VEV_TB_FIRST, VEV_TB_SAMEKEY, VEV_TB_VARIANT,
+-    VEV_TB_XPAGE, VEV_TB_SAMEKEY_XPAGE, VEV_TB_RACE, VEV_TB_ONEINSN, VEV_TB_INVAL, VEV_TB_INVAL_DMA, VEV_TB_FLUSH,
++    VEV_TB_XPAGE, VEV_TB_SAMEKEY_XPAGE, VEV_TB_RECYCLE, VEV_TB_RACE, VEV_TB_ONEINSN, VEV_TB_INVAL, VEV_TB_INVAL_DMA, VEV_TB_FLUSH,
+     /* TLB fills per (core mmu_idx & 31) * 2 + (address bit 63) */
+     VEV_FILLX, VEV_FILLX_END = VEV_FILLX + 64,
+     VEV_MAX = VEV_FILLX_END
+diff --git a/include/tcg/tcg.h b/include/tcg/tcg.h
+index 1f20c9c..7bff612 100644
+--- a/include/tcg/tcg.h
++++ b/include/tcg/tcg.h
+@@ -644,6 +644,12 @@ void tcg_pool_reset(TCGContext *s);
+ TranslationBlock *tcg_tb_alloc(TCGContext *s);
+ 
+ void tcg_region_reset_all(void);
++/* vphone-linux region recycling (accel/tcg/tb-maint.c) */
++size_t tcg_region_count(void);
++size_t tcg_region_recycle_pick(size_t k, size_t *idx);
++void tcg_region_recycle_bounds(size_t i, void **start, void **end);
++void tcg_region_recycle_foreach(size_t i, GTraverseFunc func, gpointer data);
++void tcg_region_recycle_done(size_t n, const size_t *idx);
+ 
+ size_t tcg_code_size(void);
+ size_t tcg_code_capacity(void);
+diff --git a/tcg/region.c b/tcg/region.c
+index 2bf3ce3..56bfb78 100644
+--- a/tcg/region.c
++++ b/tcg/region.c
+@@ -76,6 +76,16 @@ struct tcg_region_state {
+ 
+ static struct tcg_region_state region;
+ 
++/*
++ * vphone-linux region recycling (VPHONE_TB_RECYCLE, accel/tcg/tb-maint.c):
++ * the allocation sequence of each region, and the regions freed by a
++ * recycle, handed out again before the buffer counts as full.
++ */
++static uint64_t *vr_seq;
++static uint64_t vr_next_seq;
++static size_t *vr_free;
++static size_t vr_nfree;
++
+ /*
+  * This is an array of struct tcg_region_tree's, with padding.
+  * We use void * to simplify the computation of region_trees[i]; each
+@@ -359,14 +369,122 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
+ 
+ static bool tcg_region_alloc__locked(TCGContext *s)
+ {
+-    if (region.current == region.n) {
++    size_t idx;
++
++    if (region.current < region.n) {
++        idx = region.current++;
++    } else if (vr_nfree) {
++        idx = vr_free[--vr_nfree];
++    } else {
+         return true;
+     }
+-    tcg_region_assign(s, region.current);
+-    region.current++;
++    tcg_region_assign(s, idx);
++    if (vr_seq) {
++        vr_seq[idx] = ++vr_next_seq;
++    }
+     return false;
+ }
+ 
++static size_t tcg_region_index(const void *p)
++{
++    ptrdiff_t offset = p - region.start_aligned;
++
++    if (p < region.start_aligned) {
++        return 0;
++    }
++    return MIN(offset / region.stride, region.n - 1);
++}
++
++/*
++ * vphone-linux: pick up to @k of the oldest regions that are full (allocated,
++ * not a translation context's current region, not free). Call from a
++ * safe-work context. Returns how many, in @idx.
++ */
++size_t tcg_region_recycle_pick(size_t k, size_t *idx)
++{
++    unsigned int n_ctxs = qatomic_read(&tcg_cur_ctxs);
++    g_autofree bool *busy = g_new0(bool, region.n);
++    size_t got = 0;
++
++    qemu_mutex_lock(&region.lock);
++    if (!vr_seq) {
++        vr_seq = g_new0(uint64_t, region.n);
++        vr_free = g_new(size_t, region.n);
++        for (size_t i = 0; i < region.current; i++) {
++            vr_seq[i] = ++vr_next_seq;
++        }
++    }
++    for (unsigned int i = 0; i < n_ctxs; i++) {
++        TCGContext *s = qatomic_read(&tcg_ctxs[i]);
++
++        busy[tcg_region_index(s->code_gen_buffer)] = true;
++    }
++    for (size_t i = 0; i < vr_nfree; i++) {
++        busy[vr_free[i]] = true;
++    }
++    for (size_t i = region.current; i < region.n; i++) {
++        busy[i] = true;
++    }
++    while (got < k) {
++        size_t best = region.n;
++
++        for (size_t i = 0; i < region.n; i++) {
++            if (!busy[i] && (best == region.n || vr_seq[i] < vr_seq[best])) {
++                best = i;
++            }
++        }
++        if (best == region.n) {
++            break;
++        }
++        busy[best] = true;
++        idx[got++] = best;
++    }
++    qemu_mutex_unlock(&region.lock);
++    return got;
++}
++
++/* vphone-linux: the number of regions. */
++size_t tcg_region_count(void)
++{
++    return region.n;
++}
++
++/* vphone-linux: the bounds of region @i, for tb-maint.c. */
++void tcg_region_recycle_bounds(size_t i, void **start, void **end)
++{
++    tcg_region_bounds(i, start, end);
++}
++
++/* vphone-linux: visit the TBs of region @i. */
++void tcg_region_recycle_foreach(size_t i, GTraverseFunc func, gpointer data)
++{
++    struct tcg_region_tree *rt = region_trees + i * tree_size;
++
++    qemu_mutex_lock(&rt->lock);
++    q_tree_foreach(rt->tree, func, data);
++    qemu_mutex_unlock(&rt->lock);
++}
++
++/* vphone-linux: empty the regions in @idx (their TBs invalidated) and free them. */
++void tcg_region_recycle_done(size_t n, const size_t *idx)
++{
++    qemu_mutex_lock(&region.lock);
++    for (size_t j = 0; j < n; j++) {
++        struct tcg_region_tree *rt = region_trees + idx[j] * tree_size;
++        void *start, *end;
++
++        qemu_mutex_lock(&rt->lock);
++        q_tree_ref(rt->tree);
++        q_tree_destroy(rt->tree);
++        qemu_mutex_unlock(&rt->lock);
++        tcg_region_bounds(idx[j], &start, &end);
++        region.agg_size_full -= MIN(region.agg_size_full,
++                                    (size_t)(end - start) - TCG_HIGHWATER);
++        vr_free[vr_nfree++] = idx[j];
++    }
++    qemu_mutex_unlock(&region.lock);
++}
++
+ /*
+  * Request a new region once the one in use has filled up.
+  * Returns true on error.
+@@ -412,6 +530,7 @@ void tcg_region_reset_all(void)
+     qemu_mutex_lock(&region.lock);
+     region.current = 0;
+     region.agg_size_full = 0;
++    vr_nfree = 0;
+ 
+     for (i = 0; i < n_ctxs; i++) {
+         TCGContext *s = qatomic_read(&tcg_ctxs[i]);
+diff --git a/util/vphone-ev.c b/util/vphone-ev.c
+index 7030c57..0e6c126 100644
+--- a/util/vphone-ev.c
++++ b/util/vphone-ev.c
+@@ -39,7 +39,7 @@ static const char *const vev_names[VEV_MAX] = {
+     [VEV_GXF_ERET_FLUSH] = "gxf_eret_flush", [VEV_TB_FIRST] = "tb_first",
+     [VEV_TB_SAMEKEY] = "tb_again_samekey", [VEV_TB_VARIANT] = "tb_again_variant",
+     [VEV_TB_XPAGE] = "tb_crosspage", [VEV_TB_SAMEKEY_XPAGE] = "tb_again_samekey_crosspage",
+-    [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
++    [VEV_TB_RECYCLE] = "tb_recycle", [VEV_TB_RACE] = "tb_race", [VEV_TB_ONEINSN] = "tb_oneinsn", [VEV_TB_INVAL] = "tb_inval",
+     [VEV_TB_INVAL_DMA] = "tb_inval_dma_calls", [VEV_TB_FLUSH] = "tb_flush",
+ };
+ 
+-- 
+2.47.0.windows.2
+

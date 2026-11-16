@@ -1,0 +1,321 @@
+From cf0a267f78987926c79e3594e418eb3a3e26055b Mon Sep 17 00:00:00 2001
+From: virt-ios <virt-ios@localhost>
+Date: Sat, 14 Nov 2026 13:32:52 +0700
+Subject: [PATCH 2/5] apple-gfx with reims-vgpu on Windows
+
+memory-backend-section (Windows only): guest RAM on a pagefile-backed
+section, mapped at a 2 MiB-aligned address (a placeholder replaced by the
+view), registered so apple-gfx can hand reims-vgpu the section HANDLE in
+RvgMemoryRangeFile.fd (Windows handles are 32-bit significant); the
+library maps its views of guest pages from it, as it does from
+memory-backend-memfd,share=on on Linux.
+
+meson: reims-vgpu (pvg) is looked up on Windows, and CONFIG_MAC_PVG is set
+for aarch64-softmmu under TCG there as on Linux.
+
+Verified: qemu-system-aarch64.exe links libreims_vgpu.a (windows-gnu,
+UCRT64), contains apple-gfx-mmio and lists memory-backend-section; no
+guest booted yet.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ backends/hostmem-section.c       | 182 +++++++++++++++++++++++++++++++
+ backends/meson.build             |   4 +
+ hw/display/apple-gfx.c           |  16 +++
+ include/system/hostmem-section.h |  18 +++
+ meson.build                      |   7 +-
+ 5 files changed, 224 insertions(+), 3 deletions(-)
+ create mode 100644 backends/hostmem-section.c
+ create mode 100644 include/system/hostmem-section.h
+
+diff --git a/backends/hostmem-section.c b/backends/hostmem-section.c
+new file mode 100644
+index 0000000..a120ac9
+--- /dev/null
++++ b/backends/hostmem-section.c
+@@ -0,0 +1,182 @@
++/*
++ * QEMU host memory backend on a Windows section (pagefile-backed file mapping).
++ *
++ * memory-backend-section,id=ram,size=8G is guest RAM that another component can make views of:
++ * reims-vgpu (apple-gfx) maps views of the guest's pages from the section, as on Linux it maps
++ * them from memory-backend-memfd,share=on's memfd. The RAM is mapped at a 2 MiB-aligned address
++ * (a placeholder replaced by the view), and the backend registers (host address, size, section)
++ * so hw/display/apple-gfx.c can hand the section's HANDLE to the library in place of an fd
++ * (qemu_win_section_lookup).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "system/hostmem.h"
++#include "system/hostmem-section.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "qemu/thread.h"
++#include "qom/object_interfaces.h"
++
++#define TYPE_MEMORY_BACKEND_SECTION "memory-backend-section"
++#define SECTION_ALIGN (2 * 1024 * 1024)
++
++#ifndef MEM_RESERVE_PLACEHOLDER
++#define MEM_RESERVE_PLACEHOLDER 0x00040000
++#endif
++#ifndef MEM_REPLACE_PLACEHOLDER
++#define MEM_REPLACE_PLACEHOLDER 0x00004000
++#endif
++#ifndef MEM_PRESERVE_PLACEHOLDER
++#define MEM_PRESERVE_PLACEHOLDER 0x00000002
++#endif
++
++typedef PVOID (WINAPI *VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
++typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG,
++                                         void *, ULONG);
++
++/* The sections registered, for qemu_win_section_lookup. */
++typedef struct SectionRange {
++    uint8_t *host;
++    uint64_t size;
++    HANDLE section;
++} SectionRange;
++
++static QemuMutex ranges_lock;
++static GArray *ranges;
++
++static void ranges_init(void)
++{
++    static bool done;
++    if (!done) {
++        qemu_mutex_init(&ranges_lock);
++        ranges = g_array_new(false, false, sizeof(SectionRange));
++        done = true;
++    }
++}
++
++bool qemu_win_section_lookup(const void *host, uint64_t length, HANDLE *section,
++                             uint64_t *offset)
++{
++    bool found = false;
++    const uint8_t *p = host;
++
++    ranges_init();
++    qemu_mutex_lock(&ranges_lock);
++    for (guint i = 0; i < ranges->len; i++) {
++        SectionRange *r = &g_array_index(ranges, SectionRange, i);
++        if (p >= r->host && p + length <= r->host + r->size) {
++            *section = r->section;
++            *offset = p - r->host;
++            found = true;
++            break;
++        }
++    }
++    qemu_mutex_unlock(&ranges_lock);
++    return found;
++}
++
++/* `size` bytes of `section` at a 2 MiB-aligned address: a placeholder cut to the aligned piece,
++ * which the view replaces; the cut-off ends are given back. */
++static void *map_aligned(HANDLE section, uint64_t size, Error **errp)
++{
++    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
++    VirtualAlloc2Fn va2 = kb ? (VirtualAlloc2Fn)GetProcAddress(kb, "VirtualAlloc2") : NULL;
++    MapViewOfFile3Fn mvf3 = kb ? (MapViewOfFile3Fn)GetProcAddress(kb, "MapViewOfFile3") : NULL;
++    uint8_t *base, *at, *end;
++    void *view;
++
++    if (!va2 || !mvf3) {
++        error_setg(errp, "memory-backend-section needs Windows 10 1803 or later "
++                   "(VirtualAlloc2, MapViewOfFile3)");
++        return NULL;
++    }
++    base = va2(GetCurrentProcess(), NULL, size + SECTION_ALIGN,
++               MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
++    if (!base) {
++        error_setg_win32(errp, GetLastError(), "cannot reserve guest RAM address space");
++        return NULL;
++    }
++    at = (uint8_t *)ROUND_UP((uintptr_t)base, SECTION_ALIGN);
++    end = base + size + SECTION_ALIGN;
++    if (at > base &&
++        !VirtualFree(base, at - base, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
++        goto split_failed;
++    }
++    if (at + size < end &&
++        !VirtualFree(at, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
++        goto split_failed;
++    }
++    view = mvf3(section, GetCurrentProcess(), at, 0, size, MEM_REPLACE_PLACEHOLDER,
++                PAGE_READWRITE, NULL, 0);
++    if (view != at) {
++        error_setg_win32(errp, GetLastError(), "cannot map the guest RAM section");
++        return NULL;
++    }
++    if (at > base) {
++        VirtualFree(base, 0, MEM_RELEASE);
++    }
++    if (at + size < end) {
++        VirtualFree(at + size, 0, MEM_RELEASE);
++    }
++    return at;
++
++split_failed:
++    error_setg_win32(errp, GetLastError(), "cannot split the guest RAM placeholder");
++    VirtualFree(base, 0, MEM_RELEASE);
++    return NULL;
++}
++
++static bool section_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
++{
++    g_autofree char *name = NULL;
++    HANDLE section;
++    void *host;
++    SectionRange r;
++
++    if (!backend->size) {
++        error_setg(errp, "can't create backend with size 0");
++        return false;
++    }
++    section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
++                                 (DWORD)(backend->size >> 32), (DWORD)backend->size, NULL);
++    if (!section) {
++        error_setg_win32(errp, GetLastError(), "cannot create the guest RAM section");
++        return false;
++    }
++    host = map_aligned(section, backend->size, errp);
++    if (!host) {
++        CloseHandle(section);
++        return false;
++    }
++    name = host_memory_backend_get_name(backend);
++    memory_region_init_ram_ptr(&backend->mr, OBJECT(backend), name, backend->size, host);
++
++    ranges_init();
++    r = (SectionRange){ .host = host, .size = backend->size, .section = section };
++    qemu_mutex_lock(&ranges_lock);
++    g_array_append_val(ranges, r);
++    qemu_mutex_unlock(&ranges_lock);
++    return true;
++}
++
++static void section_backend_class_init(ObjectClass *oc, const void *data)
++{
++    HostMemoryBackendClass *bc = MEMORY_BACKEND_CLASS(oc);
++
++    bc->alloc = section_backend_memory_alloc;
++}
++
++static const TypeInfo section_backend_info = {
++    .name = TYPE_MEMORY_BACKEND_SECTION,
++    .parent = TYPE_MEMORY_BACKEND,
++    .class_init = section_backend_class_init,
++};
++
++static void register_types(void)
++{
++    type_register_static(&section_backend_info);
++}
++
++type_init(register_types);
+diff --git a/backends/meson.build b/backends/meson.build
+index 32cba80..989fd2d 100644
+--- a/backends/meson.build
++++ b/backends/meson.build
+@@ -17,6 +17,10 @@ if host_os != 'windows'
+     system_ss.add([files('hostmem-shm.c'), rt])
+   endif
+ endif
++if host_os == 'windows'
++  # Guest RAM on a section, which reims-vgpu (apple-gfx) maps views of.
++  system_ss.add(files('hostmem-section.c'))
++endif
+ if host_os == 'linux'
+   system_ss.add(files('hostmem-memfd.c'))
+   system_ss.add(files('host_iommu_device.c'))
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index c61ecb1..b6659e9 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -31,6 +31,7 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "apple-gfx.h"
++#include "system/hostmem-section.h"
+ #include "trace.h"
+ 
+ static const AppleGFXDisplayMode apple_gfx_default_modes[] = {
+@@ -614,6 +615,21 @@ static RvgMemoryRangeFile apple_gfx_memory_range_file(const MemoryRegion *mr,
+ {
+     RAMBlock *rb = mr->ram_block;
+     RvgMemoryRangeFile file = { .fd = -1 };
++#ifdef _WIN32
++    /*
++     * Windows: guest RAM from memory-backend-section; the library takes the section's HANDLE in
++     * `fd` (handles are 32-bit significant, sign-extended) and duplicates it.
++     */
++    HANDLE section;
++    uint64_t offset;
++
++    if (qemu_win_section_lookup(host, qemu_real_host_page_size(), &section, &offset)) {
++        file.fd = (int32_t)(intptr_t)section;
++        file.offset = offset;
++    }
++    (void)rb;
++    return file;
++#endif
+     int fd = memory_region_get_fd(mr);
+ 
+     if (fd >= 0 && qemu_ram_is_shared(rb) &&
+diff --git a/include/system/hostmem-section.h b/include/system/hostmem-section.h
+new file mode 100644
+index 0000000..7726fd0
+--- /dev/null
++++ b/include/system/hostmem-section.h
+@@ -0,0 +1,18 @@
++/*
++ * memory-backend-section (Windows): guest RAM on a section other components map views of.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef SYSTEM_HOSTMEM_SECTION_H
++#define SYSTEM_HOSTMEM_SECTION_H
++
++#ifdef _WIN32
++/*
++ * The section behind `length` bytes of guest RAM at `host`, and the bytes' offset in it, where a
++ * memory-backend-section holds them all; false otherwise. The handle stays the backend's.
++ */
++bool qemu_win_section_lookup(const void *host, uint64_t length, HANDLE *section,
++                             uint64_t *offset);
++#endif
++
++#endif
+diff --git a/meson.build b/meson.build
+index 1380d7c..d7fb813 100644
+--- a/meson.build
++++ b/meson.build
+@@ -733,7 +733,7 @@ endif
+ # The paravirtualized GPU device (apple-gfx) runs on libreims_vgpu, a
+ # replacement for ParavirtualizedGraphics.framework, found through pkg-config
+ # (configure with PKG_CONFIG_PATH=<reims-vgpu>/target/dist-*/lib/pkgconfig).
+-if host_os in ['darwin', 'linux']
++if host_os in ['darwin', 'linux', 'windows']
+   pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
+                    required: get_option('pvg'))
+ endif
+@@ -3190,10 +3190,11 @@ foreach target : target_dirs
+     target_kconfig += 'CONFIG_TARGET_BIG_ENDIAN=' + config_target['TARGET_BIG_ENDIAN']
+ 
+     # PVG serves the targets this host accelerates, and, since the library
+-    # takes the guest's page size per device, arm64 guests under TCG on Linux.
++    # takes the guest's page size per device, arm64 guests under TCG on Linux
++    # and Windows.
+     if pvg.found() and (target in accelerator_targets.get('CONFIG_HVF', []) or
+                         target in accelerator_targets.get('CONFIG_KVM', []) or
+-                        (host_os == 'linux' and target == 'aarch64-softmmu'))
++                        (host_os in ['linux', 'windows'] and target == 'aarch64-softmmu'))
+       target_kconfig += 'CONFIG_MAC_PVG=y'
+     endif
+ 
+-- 
+2.47.0.windows.2
+
