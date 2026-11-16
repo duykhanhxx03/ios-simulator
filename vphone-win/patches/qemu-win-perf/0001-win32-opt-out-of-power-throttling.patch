@@ -1,0 +1,42 @@
+diff --git a/os-win32.c b/os-win32.c
+index c1bff80..3d07153 100644
+--- a/os-win32.c
++++ b/os-win32.c
+@@ -47,9 +47,37 @@ static void os_undo_timer_resolution(void)
+     timeEndPeriod(mm_tc.wPeriodMin);
+ }
+ 
++/*
++ * Windows 11 power throttling.  Since Windows 11 a process whose windows are
++ * minimised, fully occluded or otherwise invisible (and a process with no
++ * window at all may be treated the same) no longer gets the timer resolution
++ * it asked for with timeBeginPeriod(): its waits fall back to the 15.6 ms
++ * system tick.  Every guest timer interrupt is a QEMUTimer that the main loop
++ * waits for, so a VM that is not in the foreground would see its timers
++ * fire up to ~16 ms late.  Windows may also put such a process under EcoQoS
++ * (lower clocks, efficiency cores).  An emulator wants neither: opt out of
++ * both.  Harmless where unsupported (SetProcessInformation fails before
++ * Windows 10 1709 / 21H2 for the timer bit; the result is ignored).
++ */
++static void os_disable_power_throttling(void)
++{
++    PROCESS_POWER_THROTTLING_STATE state = {
++        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
++        /* Take control of both policies ... */
++        .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
++                       PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
++        /* ... and turn both off: HighQoS, timer requests always honoured. */
++        .StateMask = 0,
++    };
++
++    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
++                          &state, sizeof(state));
++}
++
+ void os_setup_early_signal_handling(void)
+ {
+     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
++    os_disable_power_throttling();
+     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
+     timeBeginPeriod(mm_tc.wPeriodMin);
+     atexit(os_undo_timer_resolution);

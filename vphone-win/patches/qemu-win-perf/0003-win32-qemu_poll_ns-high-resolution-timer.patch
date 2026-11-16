@@ -1,0 +1,84 @@
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index 1fb48be..2ed1d48 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -320,12 +320,78 @@ int qemu_timeout_ns_to_ms(int64_t ns)
+ }
+ 
+ 
++#ifdef _WIN32
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++/* Shorter waits than this get the high-resolution timer below. */
++#define QEMU_POLL_HIRES_MAX_NS (50 * SCALE_MS)
++
++/*
++ * g_poll() takes whole milliseconds (qemu_timeout_ns_to_ms() rounds up), and
++ * a Windows timed wait ends on a timer tick: even at timeBeginPeriod(1) a
++ * 100 us deadline sleeps 1-2 ms.  The main loop serves every guest timer
++ * (the Arm generic timer interrupts are QEMUTimers on QEMU_CLOCK_VIRTUAL),
++ * so short guest timeouts all stretch to 1-2 ms, where ppoll() on Linux
++ * wakes within microseconds.  For short waits add a high-resolution
++ * waitable timer (Windows 10 1803+, no global timer resolution needed) to
++ * the handles polled, armed at the exact deadline.  Its handle is per thread
++ * and lives as long as the thread.
++ */
++static int qemu_poll_ns_win32(GPollFD *fds, guint nfds, int64_t timeout)
++{
++    static __thread HANDLE timer;
++    static __thread bool timer_unavailable;
++    int ms = qemu_timeout_ns_to_ms(timeout);
++    LARGE_INTEGER due;
++    GPollFD *pfds;
++    int ret;
++
++    if (timeout <= 0 || timeout >= QEMU_POLL_HIRES_MAX_NS ||
++        timer_unavailable) {
++        return g_poll(fds, nfds, ms);
++    }
++    if (!timer) {
++        timer = CreateWaitableTimerExW(NULL, NULL,
++                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                       TIMER_ALL_ACCESS);
++        if (!timer) {
++            timer_unavailable = true;   /* older Windows: ms waits */
++            return g_poll(fds, nfds, ms);
++        }
++    }
++    /* Relative due time, in 100 ns units (negative = relative). */
++    due.QuadPart = -(LONGLONG)DIV_ROUND_UP(timeout, 100);
++    /* (Re)arming also clears a signal left from an earlier, unused wait. */
++    if (!SetWaitableTimerEx(timer, &due, 0, NULL, NULL, NULL, 0)) {
++        return g_poll(fds, nfds, ms);
++    }
++
++    pfds = g_newa(GPollFD, nfds + 1);
++    memcpy(pfds, fds, nfds * sizeof(*pfds));
++    pfds[nfds] = (GPollFD) { .fd = (gintptr)timer, .events = G_IO_IN };
++
++    /* The ms timeout stays as a backstop; the timer fires first. */
++    ret = g_poll(pfds, nfds + 1, ms);
++
++    for (guint i = 0; i < nfds; i++) {
++        fds[i].revents = pfds[i].revents;
++    }
++    if (ret > 0 && pfds[nfds].revents) {
++        ret--;      /* the timer is not one of the caller's fds */
++    }
++    return ret;
++}
++#endif
++
+ /* qemu implementation of g_poll which uses a nanosecond timeout but is
+  * otherwise identical to g_poll
+  */
+ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+ {
+-#ifdef CONFIG_PPOLL
++#ifdef _WIN32
++    return qemu_poll_ns_win32(fds, nfds, timeout);
++#elif defined(CONFIG_PPOLL)
+     if (timeout < 0) {
+         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);
+     } else {

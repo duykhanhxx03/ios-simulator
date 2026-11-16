@@ -1,0 +1,16 @@
+﻿[package]
+name = "gpu-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Runs reims-vgpu-vulkan's Windows smoke check (guest pages imported into the GPU by pointer)"
+
+[dependencies]
+reims-vgpu-vulkan = { path = "../../../refs/vphone-linux/reims-vgpu/crates/reims-vgpu-vulkan" }
+
+[workspace]
+
+# The same metal2vulkan as reims-vgpu's workspace (vphone-linux's checkout, Windows branch).
+[patch."https://github.com/steelbrain/metal2vulkan"]
+metal2vulkan = { path = "../../../refs/vphone-linux/metal2vulkan/crates/metal2vulkan" }
+metal2vulkan-runtime = { path = "../../../refs/vphone-linux/metal2vulkan/crates/metal2vulkan-runtime" }

@@ -1,0 +1,15 @@
+[package]
+name = "winvm"
+version = "0.1.0"
+edition = "2021"
+description = "Mach-style VM calls (allocate, remap as a shared alias, protect, deallocate) on Windows placeholders, for reims-vgpu's Windows platform"
+license = "MIT OR GPL-2.0-or-later"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

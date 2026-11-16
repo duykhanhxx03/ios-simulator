@@ -1,0 +1,53 @@
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index fd6972b..c221825 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -821,11 +821,25 @@ extern int64_t clock_start;
+    an infinite recursion! */
+ #ifdef _WIN32
+ extern int64_t clock_freq;
++/* NANOSECONDS_PER_SECOND / clock_freq when that is exact, else 0. */
++extern int64_t clock_ns_per_tick;
+ 
+ static inline int64_t get_clock(void)
+ {
+     LARGE_INTEGER ti;
+     QueryPerformanceCounter(&ti);
++    /*
++     * The QPC frequency is 10 MHz on Windows 10 and later, which divides
++     * 1 GHz: scale with one multiply.  muldiv64() is a signed 128-bit
++     * division (a libgcc __divti3 call, tens of cycles) and this is on the
++     * path of every guest CNTVCT/CNTPCT read (gt_get_countervalue() ->
++     * qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)), which XNU's
++     * mach_absolute_time() does all the time.  The product cannot overflow
++     * before the nanosecond value itself would (~292 years of uptime).
++     */
++    if (likely(clock_ns_per_tick)) {
++        return ti.QuadPart * clock_ns_per_tick;
++    }
+     return muldiv64(ti.QuadPart, NANOSECONDS_PER_SECOND, clock_freq);
+ }
+ 
+diff --git a/util/qemu-timer-common.c b/util/qemu-timer-common.c
+index 28803f2..f03412c 100644
+--- a/util/qemu-timer-common.c
++++ b/util/qemu-timer-common.c
+@@ -32,6 +32,7 @@ int64_t clock_start;
+ #ifdef _WIN32
+ 
+ int64_t clock_freq;
++int64_t clock_ns_per_tick;
+ 
+ static void __attribute__((constructor)) init_get_clock(void)
+ {
+@@ -43,6 +44,10 @@ static void __attribute__((constructor)) init_get_clock(void)
+         exit(1);
+     }
+     clock_freq = freq.QuadPart;
++    if (clock_freq <= NANOSECONDS_PER_SECOND &&
++        NANOSECONDS_PER_SECOND % clock_freq == 0) {
++        clock_ns_per_tick = NANOSECONDS_PER_SECOND / clock_freq;
++    }
+     clock_start = get_clock();
+ }
+ 
